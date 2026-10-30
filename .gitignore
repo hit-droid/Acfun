@@ -1,0 +1,6 @@
+build/
+*.acfun
+*.o
+*.a
+.DS_Store
+core.*

@@ -1,0 +1,25 @@
+#pragma once
+/* Acfun 内部接口声明 (不对外暴露) */
+#include <cstddef>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* 标量参考实现 (正确性基线) —— 方阵/整阵，行列主序步长均为 N */
+void acfun_gemm_ref(int M, int N, int K,
+                    const float* A, const float* B, float* C);
+
+/* 带主维度(ldA,ldB,ldC)的通用标量实现，用于尾部余数子块 */
+void acfun_gemm_ref_ld(int M, int N, int K,
+                       int ldA, int ldB, int ldC,
+                       const float* A, const float* B, float* C);
+
+/* SIMD 后端实现 (各自编译单元带对应 -march) */
+void acfun_gemm_avx2(int M, int N, int K,
+                     const float* A, const float* B, float* C);
+void acfun_gemm_avx512(int M, int N, int K,
+                       const float* A, const float* B, float* C);
+
+#ifdef __cplusplus
+}
+#endif
