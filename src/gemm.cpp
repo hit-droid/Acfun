@@ -34,8 +34,9 @@ const char* acfun_backend_name(void) {
 void acfun_gemm(int M, int N, int K,
                 const float* A, const float* B, float* C) {
     int nt = (g_threads > 0) ? g_threads : omp_get_max_threads();
-    /* 小矩阵走串行：避免 OpenMP 线程池开销压垮微薄的计算量 */
-    if (M < 128 || N < 128 || K < 128) nt = 1;
+    /* 小矩阵走串行：避免 OpenMP 线程池开销压垮微薄的计算量
+     * (同时避免 N 维不足一个 NC 块时无法并行却仍付并行开销的回归) */
+    if (M < 256 || N < 256 || K < 256) nt = 1;
     omp_set_num_threads(nt);
     int b = detect_backend();
     if (b == 1)      acfun_gemm_avx512(M, N, K, A, B, C);

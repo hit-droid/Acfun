@@ -38,6 +38,12 @@ void acfun_conv2d(const float* input, int N, int H, int W, int Cin,
                   int KH, int KW, int Cout, int stride, int pad,
                   float* output);
 
+/* 卷积 + 融合 ReLU (输出写入时就地施加, 省去额外激活扫描) */
+void acfun_conv2d_relu(const float* input, int N, int H, int W, int Cin,
+                       const float* weight, const float* bias,
+                       int KH, int KW, int Cout, int stride, int pad,
+                       float* output);
+
 /* 全连接: out[N, Cout] = in[N, Cin] * W[Cin, Cout] + bias */
 void acfun_fc(const float* input, int N, int Cin,
               const float* weight, const float* bias, int Cout, float* output);

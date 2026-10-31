@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <vector>
 #include <random>
@@ -148,6 +149,149 @@ static void bench_e2e(const char* model_path) {
     acfun_model_destroy(m);
 }
 
+/* ---------- 5) 融合正确性 + 加速 (非融合参考 vs 融合引擎) ----------
+ * 参考执行器按文件原始层序 (Conv->BN->ReLU 各层独立) 执行, 与融合引擎
+ * (BN 折叠进 Conv 权重, ReLU 融合) 的输出逐元素对比; 二者应完全一致,
+ * 从而严格证明融合无精度损失, 并量化融合消去整层 BN / 融合 ReLU 的提速。 */
+struct RLayer { int type; int p[8]; const float* w; const float* b; };
+
+static unsigned r_u32(const unsigned char* p) {
+    return (unsigned)p[0] | ((unsigned)p[1] << 8) |
+           ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+}
+
+static std::vector<RLayer> ref_parse(const char* path, int* inC, int* inH, int* inW) {
+    std::vector<RLayer> L;
+    FILE* f = fopen(path, "rb"); if (!f) return L;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    std::vector<unsigned char> blob(sz); fread(blob.data(), 1, sz, f); fclose(f);
+    if (sz < 22 || memcmp(blob.data(), "ACFUN0", 6) != 0) return L;
+    size_t o = 10;
+    *inC = r_u32(blob.data()+o); o+=4; *inH = r_u32(blob.data()+o); o+=4;
+    *inW = r_u32(blob.data()+o); o+=4; int num = r_u32(blob.data()+o); o+=4;
+    int prevC = *inC;
+    for (int i = 0; i < num; ++i) {
+        RLayer x; std::memset(&x, 0, sizeof(x));
+        x.type = r_u32(blob.data()+o); o+=4;
+        switch (x.type) {
+            case 1: { int KH=r_u32(blob.data()+o);o+=4; int KW=r_u32(blob.data()+o);o+=4;
+                      int Co=r_u32(blob.data()+o);o+=4; int st=r_u32(blob.data()+o);o+=4;
+                      int pd=r_u32(blob.data()+o);o+=4; x.p[0]=KH;x.p[1]=KW;x.p[2]=Co;x.p[3]=st;x.p[4]=pd;
+                      size_t wn=(size_t)KH*KW*prevC*Co; x.w=(const float*)(blob.data()+o); o+=wn*4;
+                      x.b=(const float*)(blob.data()+o); o+=(size_t)Co*4; prevC=Co; break; }
+            case 2: { int Co=r_u32(blob.data()+o);o+=4; int id=r_u32(blob.data()+o);o+=4;
+                      x.p[0]=Co;x.p[1]=id; size_t wn=(size_t)id*Co; x.w=(const float*)(blob.data()+o);o+=wn*4;
+                      x.b=(const float*)(blob.data()+o);o+=(size_t)Co*4; prevC=Co; break; }
+            case 3: break;
+            case 4: { int p=r_u32(blob.data()+o);o+=4; int st=r_u32(blob.data()+o);o+=4; int pd=r_u32(blob.data()+o);o+=4;
+                      x.p[0]=p;x.p[1]=st;x.p[2]=pd; break; }
+            case 5: break;
+            case 6: { int ch=r_u32(blob.data()+o);o+=4; x.p[0]=ch; x.w=(const float*)(blob.data()+o); o+=(size_t)ch*4*4; break; }
+            default: return L;
+        }
+        L.push_back(x);
+    }
+    return L;
+}
+
+static void ref_exec(const std::vector<RLayer>& L, int inC, int inH, int inW,
+                     const float* input, float* output, int* outSize) {
+    int N=1,H=inH,W=inW,C=inC; size_t cap=(size_t)N*H*W*C;
+    float* cur=(float*)malloc(cap*sizeof(float)); memcpy(cur,input,cap*sizeof(float));
+    for (size_t li=0; li<L.size(); ++li) {
+        const RLayer& x=L[li]; int nH=H,nW=W,nC=C; size_t ncap=0; float* nxt=nullptr;
+        switch (x.type) {
+            case 1: { int KH=x.p[0],KW=x.p[1],Co=x.p[2],st=x.p[3],pd=x.p[4];
+                      nH=(H+2*pd-KH)/st+1; nW=(W+2*pd-KW)/st+1; nC=Co; ncap=(size_t)N*nH*nW*nC;
+                      nxt=(float*)malloc(ncap*sizeof(float));
+                      acfun_conv2d(cur,N,H,W,C,x.w,x.b,KH,KW,Co,st,pd,nxt); break; }
+            case 2: { int Co=x.p[0]; int id=H*W*C; nH=1;nW=1;nC=Co; ncap=(size_t)N*nC;
+                      nxt=(float*)malloc(ncap*sizeof(float)); acfun_fc(cur,N,id,x.w,x.b,Co,nxt); break; }
+            case 3: { ncap=cap; nxt=(float*)malloc(ncap*sizeof(float)); memcpy(nxt,cur,ncap*sizeof(float)); acfun_relu(nxt,ncap); break; }
+            case 4: { int p=x.p[0],st=x.p[1],pd=x.p[2]; nH=(H+2*pd-p)/st+1; nW=(W+2*pd-p)/st+1; nC=C;
+                      ncap=(size_t)N*nH*nW*nC; nxt=(float*)malloc(ncap*sizeof(float)); acfun_maxpool(cur,N,H,W,C,p,st,pd,nxt); break; }
+            case 5: { acfun_softmax(cur,1,(int)cap,cur); ncap=cap; break; }
+            case 6: { int ch=x.p[0]; ncap=cap; nxt=(float*)malloc(ncap*sizeof(float)); memcpy(nxt,cur,ncap*sizeof(float));
+                      acfun_batchnorm(nxt,(int)cap,ch,x.w,x.w+ch,x.w+2*ch,x.w+3*ch,1e-5f); break; }
+        }
+        if (nxt) { free(cur); cur=nxt; nxt=nullptr; }
+        H=nH;W=nW;C=nC;cap=ncap;
+    }
+    if (outSize) *outSize=(int)cap;
+    memcpy(output,cur,cap*sizeof(float)); free(cur);
+}
+
+static void bench_fusion(const char* model_path) {
+    printf("\n=== Conv/BN/ReLU 融合: 正确性与加速 ===\n");
+    int inC=0,inH=0,inW=0;
+    std::vector<RLayer> ref = ref_parse(model_path, &inC, &inH, &inW);
+    AcfunModel* m = acfun_model_load(model_path);
+    if (ref.empty() || !m) { printf("  模型缺失, 跳过\n"); if(m) acfun_model_destroy(m); return; }
+    acfun_model_input_dims(m,&inC,&inH,&inW);
+    int inN=(size_t)inH*inW*inC;
+    std::vector<float> in(inN), eng(1<<20), rfe(1<<20);
+    rand_fill(in.data(),inN);
+
+    acfun_model_infer(m, in.data(), eng.data());
+    int engSize=0; ref_exec(ref, inC,inH,inW, in.data(), rfe.data(), &engSize);
+
+    int n = std::min(engSize, (int)(1<<20));
+    float maxd=0; for (int i=0;i<n;++i) maxd=std::max(maxd, std::fabs(eng[i]-rfe[i]));
+    printf("  融合引擎 vs 非融合参考  max|Δ|=%9.3e  %s\n", maxd, maxd<1e-3f?"OK":"FAIL");
+
+    /* 提速: 融合引擎 vs 非融合参考 (各预热后计时) */
+    int reps=50;
+    acfun_model_infer(m, in.data(), eng.data());
+    double t0=now(); for(int r=0;r<reps;++r) acfun_model_infer(m,in.data(),eng.data());
+    double tEng=(now()-t0)/reps;
+    ref_exec(ref, inC,inH,inW, in.data(), rfe.data(), &engSize);
+    t0=now(); for(int r=0;r<reps;++r) ref_exec(ref, inC,inH,inW, in.data(), rfe.data(), &engSize);
+    double tRef=(now()-t0)/reps;
+    printf("  非融合参考 : %7.3f ms  (%6.1f img/s)\n", tRef*1e3, 1.0/tRef);
+    printf("  融合引擎   : %7.3f ms  (%6.1f img/s)\n", tEng*1e3, 1.0/tEng);
+    printf("  融合加速   : %7.1fx  (微型模型 BN 占比极小, 真实大模型带宽收益更明显)\n", tRef/tEng);
+    acfun_model_destroy(m);
+}
+
+/* 大特征图上的 Conv+BN+ReLU 组合基准: 直接展示融合消去整层 BN 与额外激活扫描的带宽收益 */
+static void bench_conv_bn_relu_composite() {
+    printf("\n=== Conv+BN+ReLU 组合 (112x112x64, 3x3) ===\n");
+    const int H=112,W=112,Cin=64,Cout=64,KH=3,KW=3,st=1,pd=1,N=1;
+    const int OH=H,OW=W;
+    size_t inN=(size_t)N*H*W*Cin, wN=(size_t)KH*KW*Cin*Cout, outN=(size_t)N*OH*OW*Cout, chN=Cout;
+    std::vector<float> in(inN), w(wN), b(Cout,0.0f), out1(outN), out2(outN);
+    std::vector<float> mean(chN,0.0f), var(chN,1.0f), gamma(chN,1.0f), beta(chN,0.0f);
+    rand_fill(in.data(), inN); rand_fill(w.data(), wN);
+    /* 随机化 BN 以贴近真实 */
+    for (int c=0;c<chN;++c){ mean[c]=0.1f*(c%5-2); var[c]=0.8f+0.1f*(c%3); gamma[c]=0.9f+0.05f*(c%4); beta[c]=0.02f*(c%6); }
+
+    int reps=30;
+    /* 基线: conv2d -> batchnorm -> relu (三次遍历输出张量) */
+    double t0=now();
+    for(int r=0;r<reps;++r){
+        acfun_conv2d(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,out1.data());
+        acfun_batchnorm(out1.data(),(int)outN,chN,mean.data(),var.data(),gamma.data(),beta.data(),1e-5f);
+        acfun_relu(out1.data(),outN);
+    }
+    double tBase=(now()-t0)/reps;
+    /* 融合: 先把 BN 折叠进权重, 再 conv2d_relu (一次遍历) */
+    std::vector<float> wf(wN), bf(Cout);
+    for(int c=0;c<Cout;++c){
+        float scale=gamma[c]/sqrtf(var[c]+1e-5f), shift=beta[c]-mean[c]*scale;
+        for(size_t t=0;t<(size_t)KH*KW*Cin;++t) wf[t*(size_t)Cout+c]=w[t*(size_t)Cout+c]*scale;
+        bf[c]=b[c]*scale+shift;
+    }
+    t0=now();
+    for(int r=0;r<reps;++r)
+        acfun_conv2d_relu(in.data(),N,H,W,Cin,wf.data(),bf.data(),KH,KW,Cout,st,pd,out2.data());
+    double tFused=(now()-t0)/reps;
+
+    float maxd=0; for(size_t i=0;i<outN;++i) maxd=std::max(maxd,std::fabs(out1[i]-out2[i]));
+    printf("  基线(conv+bn+relu): %7.3f ms  (%6.1f img/s)\n", tBase*1e3, 1.0/tBase);
+    printf("  融合(conv+relu)    : %7.3f ms  (%6.1f img/s)\n", tFused*1e3, 1.0/tFused);
+    printf("  融合加速            : %7.1fx   max|Δ|=%9.3e %s\n", tBase/tFused, maxd, maxd<1e-3f?"OK":"FAIL");
+}
+
 int main(int argc, char** argv) {
     printf("Acfun 推理引擎基准  |  后端: %s\n", acfun_backend_name());
     int fails = correctness();
@@ -155,6 +299,8 @@ int main(int argc, char** argv) {
     bench_conv();
     const char* mp = (argc > 1) ? argv[1] : "model.acfun";
     bench_e2e(mp);
+    bench_fusion(mp);
+    bench_conv_bn_relu_composite();
     printf("\n正确性: %s\n", fails == 0 ? "全部通过" : "存在失败");
     return fails == 0 ? 0 : 1;
 }

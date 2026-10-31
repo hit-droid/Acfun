@@ -35,24 +35,26 @@ def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "model.acfun"
     inC, inH, inW = 3, 32, 32
     layers = b""
-    # Conv1: 3x3, stride1, pad1
+    # Conv1: 3x3, stride1, pad1  ->  BN  ->  ReLU  (BN 折叠进 Conv, ReLU 融合)
     body, C = conv(inC, 16, KH=3, KW=3, stride=1, pad=1); layers += body
+    layers += bn(16)
     layers += relu()
-    # Conv2: 3x3, stride2, pad1
+    # Conv2: 3x3, stride2, pad1  ->  BN  ->  ReLU
     body, C = conv(C, 32, KH=3, KW=3, stride=2, pad=1); layers += body
+    layers += bn(32)
     layers += relu()
     # MaxPool
     layers += maxpool(2, 2, 0)
-    # BN
-    layers += bn(32)
-    # FC
+    # FC (扁平 8*8*32) -> ReLU (融合)
     flatten = 8*8*32  # 经 Conv2(s2)+MaxPool(2) 后的空间展开
     body, C = fc(flatten, 10); layers += body
+    layers += relu()
+    # Softmax
     layers += softmax()
 
     blob = (MAGIC + u32(1)                       # version
             + u32(inC)+u32(inH)+u32(inW)
-            + u32(8)                             # num_layers
+            + u32(10)                            # num_layers: conv,bn,relu,conv,bn,relu,maxpool,fc,relu,softmax
             + layers)
     with open(out, "wb") as f:
         f.write(blob)

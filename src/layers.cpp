@@ -45,10 +45,11 @@ static void im2col(const float* in, int H, int W, int Cin,
     }
 }
 
-void acfun_conv2d(const float* input, int N, int H, int W, int Cin,
-                  const float* weight, const float* bias,
-                  int KH, int KW, int Cout, int stride, int pad,
-                  float* output) {
+/* 卷积内部实现: act=0 无激活, act=1 融合 ReLU (在输出写入时就地施加, 省去额外扫描) */
+static void conv2d_impl(const float* input, int N, int H, int W, int Cin,
+                        const float* weight, const float* bias,
+                        int KH, int KW, int Cout, int stride, int pad,
+                        float* output, int act) {
     int OH = (H + 2 * pad - KH) / stride + 1;
     int OW = (W + 2 * pad - KW) / stride + 1;
     if (OH <= 0 || OW <= 0) return;
@@ -62,16 +63,33 @@ void acfun_conv2d(const float* input, int N, int H, int W, int Cin,
         im2col(x, H, W, Cin, KH, KW, stride, pad, OH, OW, col);
         /* col[OH*OW, ic] * weight[ic, Cout] -> gemm_out[OH*OW, Cout] */
         acfun_gemm(OH * OW, Cout, ic, col, weight, gemm_out);
-        if (bias) {
-            for (int r = 0; r < OH * OW; ++r)
-                for (int c = 0; c < Cout; ++c)
-                    gemm_out[(size_t)r * Cout + c] += bias[c];
+        /* 偏置 + (可选)ReLU 在输出写入时融合, 单次遍历完成 */
+        float* yo = output + (size_t)n * OH * OW * Cout;
+        for (int r = 0; r < OH * OW; ++r) {
+            for (int c = 0; c < Cout; ++c) {
+                float v = gemm_out[(size_t)r * Cout + c];
+                if (bias) v += bias[c];
+                if (act == 1 && v < 0.0f) v = 0.0f;
+                yo[(size_t)r * Cout + c] = v;
+            }
         }
-        std::memcpy(output + (size_t)n * OH * OW * Cout,
-                    gemm_out, (size_t)OH * OW * Cout * sizeof(float));
     }
     free(col);
     free(gemm_out);
+}
+
+void acfun_conv2d(const float* input, int N, int H, int W, int Cin,
+                  const float* weight, const float* bias,
+                  int KH, int KW, int Cout, int stride, int pad,
+                  float* output) {
+    conv2d_impl(input, N, H, W, Cin, weight, bias, KH, KW, Cout, stride, pad, output, 0);
+}
+
+void acfun_conv2d_relu(const float* input, int N, int H, int W, int Cin,
+                       const float* weight, const float* bias,
+                       int KH, int KW, int Cout, int stride, int pad,
+                       float* output) {
+    conv2d_impl(input, N, H, W, Cin, weight, bias, KH, KW, Cout, stride, pad, output, 1);
 }
 
 void acfun_maxpool(const float* in, int N, int H, int W, int C,
