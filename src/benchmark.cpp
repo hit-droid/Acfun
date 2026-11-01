@@ -55,7 +55,7 @@ static void bench_gemm() {
     printf("\n=== GEMM 吞吐 (GFLOPS = 2·M·N·K / t) ===\n");
     printf("  多线程演示线程数 = %d (可用 ACFUN_BENCH_THREADS 覆盖)\n", mt_threads);
     printf("%-10s %12s %12s %12s %12s\n", "M=N=K", "naive", "acfun-1T", "acfun-MT", "MT加速");
-    int sizes[] = { 256, 512, 1024, 2048 };
+    int sizes[] = { 256, 512, 1024, 2048, 4096 };
     for (int S : sizes) {
         int M = S, N = S, K = S;
         std::vector<float> A((size_t)M * K), B((size_t)K * N), C((size_t)M * N);
@@ -78,6 +78,29 @@ static void bench_gemm() {
                S, gf / tnaive / 1e9, gf / t1 / 1e9, gf / tMT / 1e9,
                t1 / tMT);
     }
+}
+
+/* ---------- 2b) 多线程扩展曲线 ---------- */
+static void bench_gemm_scale() {
+    int S = 2048;
+    int M = S, N = S, K = S;
+    std::vector<float> A((size_t)M * K), B((size_t)K * N), C((size_t)M * N);
+    rand_fill(A.data(), A.size());
+    rand_fill(B.data(), B.size());
+    double gf = 2.0 * M * N * K;
+    printf("\n=== GEMM 多线程扩展曲线 (M=N=K=%d) ===\n", S);
+    printf("%-10s %14s %14s\n", "线程数", "GFLOPS", "单核效率*");
+    int threads[] = { 1, 2, 4, 8, 12, 16 };
+    for (int t : threads) {
+        acfun_set_threads(t);
+        int reps = 5;
+        double t0 = now();
+        for (int r = 0; r < reps; ++r) acfun_gemm(M, N, K, A.data(), B.data(), C.data());
+        double dt = (now() - t0) / reps;
+        double g = gf / dt / 1e9;
+        printf("%-10d %14.1f %13.1f%%\n", t, g, g / t / 194.0 * 100.0);
+    }
+    printf("  * 单核效率按本机 AVX-512 FMA 实测峰值 ~194 GFLOPS/核 折算\n");
 }
 
 /* naive 直接卷积 (NHWC) 基线 */
@@ -296,6 +319,7 @@ int main(int argc, char** argv) {
     printf("Acfun 推理引擎基准  |  后端: %s\n", acfun_backend_name());
     int fails = correctness();
     bench_gemm();
+    bench_gemm_scale();
     bench_conv();
     const char* mp = (argc > 1) ? argv[1] : "model.acfun";
     bench_e2e(mp);

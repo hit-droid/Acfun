@@ -24,6 +24,10 @@ void acfun_gemm_avx2(int M, int N, int K,
 void acfun_gemm_avx512(int M, int N, int K,
                        const float* A, const float* B, float* C);
 
+/* 调度器下发的期望线程数 (1 = 串行); 后端据此选择串行或 omp parallel num_threads */
+void acfun_set_num_threads_runtime(int n);
+int  acfun_get_num_threads_runtime(void);
+
 #ifdef __cplusplus
 }
 #endif
