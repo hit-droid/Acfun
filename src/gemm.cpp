@@ -69,8 +69,10 @@ void acfun_gemm(int M, int N, int K,
         if (e) { int v = std::atoi(e); if (v > 0) nt = v; }
     }
     if (nt <= 0) nt = physical_cores();
-    /* 小矩阵走串行：避免 OpenMP 线程池开销压垮微薄的计算量 */
-    if (M < 256 || N < 256 || K < 256) nt = 1;
+    /* 仅当三个维度都很小才走串行, 避免 OpenMP 线程池开销压垮微薄的计算量。
+     * 注意: 卷积类 GEMM 虽 N(输出通道) 很小 (如 16), 但 M(像素数) 极大,
+     * 仍应多线程; 旧版 "任一维度<256 即串行" 会错误地把这类大矩阵串行化。 */
+    if (M < 256 && N < 256 && K < 256) nt = 1;
     if (nt > 1) omp_set_num_threads(nt);
     acfun_set_num_threads_runtime(nt);
     int b = detect_backend();
