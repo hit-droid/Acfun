@@ -185,8 +185,9 @@ void acfun_gemm_avx2(int M, int N, int K,
 
     int mb = (M + MC - 1) / MC;
     int nb = (N + NC - 1) / NC;
-    std::vector<float> Apool((size_t)mb * MC * K);
-    std::vector<float> Bpool((size_t)nb * NC * K);
+    float* Apool = (float*)malloc((size_t)mb * MC * K * sizeof(float));
+    float* Bpool = (float*)malloc((size_t)nb * NC * K * sizeof(float));
+    if (!Apool || !Bpool) { free(Apool); free(Bpool); return; }
 
     #pragma omp parallel num_threads(nt)
     {
@@ -194,13 +195,13 @@ void acfun_gemm_avx2(int M, int N, int K,
         for (int mid = 0; mid < mb; ++mid) {
             int m0 = mid * MC;
             int mc = std::min(MC, M - m0);
-            packA_all(Apool.data() + (size_t)mid * MC * K, A, m0, mc, K, MC);
+            packA_all(Apool + (size_t)mid * MC * K, A, m0, mc, K, MC);
         }
         #pragma omp for schedule(dynamic, 1) nowait
         for (int nid = 0; nid < nb; ++nid) {
             int n0 = nid * NC;
             int nc = std::min(NC, N - n0);
-            packB_all(Bpool.data() + (size_t)nid * NC * K, B, n0, nc, K, NC, N);
+            packB_all(Bpool + (size_t)nid * NC * K, B, n0, nc, K, NC, N);
         }
         #pragma omp barrier
 
@@ -211,8 +212,9 @@ void acfun_gemm_avx2(int M, int N, int K,
             int m0 = mid * MC;
             int n0 = nid * NC;
             gemm_tile_packed(m0, n0, M, N, K, A, B, C, MC, NC, KC,
-                             Apool.data() + (size_t)mid * MC * K,
-                             Bpool.data() + (size_t)nid * NC * K);
+                             Apool + (size_t)mid * MC * K,
+                             Bpool + (size_t)nid * NC * K);
         }
     }
+    free(Apool); free(Bpool);
 }

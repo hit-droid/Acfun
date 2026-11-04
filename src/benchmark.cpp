@@ -88,19 +88,27 @@ static void bench_gemm_scale() {
     rand_fill(A.data(), A.size());
     rand_fill(B.data(), B.size());
     double gf = 2.0 * M * N * K;
+    /* 运行时校准参考点: 先测单线程 2048³ 吞吐 G1, 用以折算多核"线性扩展效率",
+     * 避免硬编码与本机不符的理论峰值 (不同微架构/频率下差异很大)。 */
+    acfun_set_threads(1);
+    int reps = 5;
+    double t0 = now();
+    for (int r = 0; r < reps; ++r) acfun_gemm(M, N, K, A.data(), B.data(), C.data());
+    double G1 = gf / ((now() - t0) / reps) / 1e9;
+
     printf("\n=== GEMM 多线程扩展曲线 (M=N=K=%d) ===\n", S);
-    printf("%-10s %14s %14s\n", "线程数", "GFLOPS", "单核效率*");
+    printf("  单线程参考吞吐 G1 = %6.1f GFLOPS (折算基线)\n", G1);
+    printf("%-10s %14s %16s\n", "线程数", "GFLOPS", "线性扩展*");
     int threads[] = { 1, 2, 4, 8, 12, 16 };
     for (int t : threads) {
         acfun_set_threads(t);
-        int reps = 5;
         double t0 = now();
         for (int r = 0; r < reps; ++r) acfun_gemm(M, N, K, A.data(), B.data(), C.data());
         double dt = (now() - t0) / reps;
         double g = gf / dt / 1e9;
-        printf("%-10d %14.1f %13.1f%%\n", t, g, g / t / 194.0 * 100.0);
+        printf("%-10d %14.1f %15.1f%%\n", t, g, g / (G1 * t) * 100.0);
     }
-    printf("  * 单核效率按本机 AVX-512 FMA 实测峰值 ~194 GFLOPS/核 折算\n");
+    printf("  * 线性扩展 = 实测 / (G1 × 线程数); 1→4 线程应近线性, 之后受内存带宽饱和而回落\n");
 }
 
 /* naive 直接卷积 (NHWC) 基线 */

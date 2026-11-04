@@ -69,10 +69,21 @@ void acfun_gemm(int M, int N, int K,
         if (e) { int v = std::atoi(e); if (v > 0) nt = v; }
     }
     if (nt <= 0) nt = physical_cores();
-    /* 仅当三个维度都很小才走串行, 避免 OpenMP 线程池开销压垮微薄的计算量。
-     * 注意: 卷积类 GEMM 虽 N(输出通道) 很小 (如 16), 但 M(像素数) 极大,
-     * 仍应多线程; 旧版 "任一维度<256 即串行" 会错误地把这类大矩阵串行化。 */
-    if (M < 256 && N < 256 && K < 256) nt = 1;
+
+    /* 工作感知线程选择 —— 比单纯 "三维皆<256 才串行" 更稳健:
+     * 卷积类 GEMM 虽 M(像素数) 极大、但 N(输出通道, 如 16) 极小, 计算量可能
+     * 仅几十 MFLOP。此时 OpenMP 线程派发 + 全 K 面板池(可达数 MB)的分配/零初始化
+     * 开销远超计算, 多线程反而更慢 (实测 3x3/112²/16 卷积被拖慢数十倍)。
+     * 故按总 FLOP 设每线程下限 (~64M), 不足则回落串行流水分块路径。 */
+    long long flop = (long long)2 * M * N * K;
+    bool tiny = (M < 256 && N < 256 && K < 256);
+    if (tiny) {
+        nt = 1;                       /* 极小 GEMM: 派发/池开销远超计算, 直接串行 */
+    } else {
+        long long cap = flop / (64LL * 1024 * 1024);  /* ~64M FLOP/线程 */
+        if (cap < 1) cap = 1;
+        if ((long long)nt > cap) nt = (int)cap;
+    }
     if (nt > 1) omp_set_num_threads(nt);
     acfun_set_num_threads_runtime(nt);
     int b = detect_backend();

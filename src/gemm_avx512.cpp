@@ -206,8 +206,11 @@ void acfun_gemm_avx512(int M, int N, int K,
     /* ---- 二维 (M×N) 瓦片并行: A、B 各仅全 K 打包一次 (Phase-1 并行) ---- */
     int mb = (M + MC - 1) / MC;
     int nb = (N + NC - 1) / NC;
-    std::vector<float> Apool((size_t)mb * MC * K);   /* 每个 m0 行块全 K 打包一次 */
-    std::vector<float> Bpool((size_t)nb * NC * K);   /* 每个 n0 列块全 K 打包一次 */
+    /* 用 malloc 而非 std::vector: vector 的值初始化会把整块面板零写一遍,
+     * 对窄 N 卷积(面板池可达数 MB)是纯浪费; 打包会完整覆盖所有被读元素, 无需清零。 */
+    float* Apool = (float*)malloc((size_t)mb * MC * K * sizeof(float));
+    float* Bpool = (float*)malloc((size_t)nb * NC * K * sizeof(float));
+    if (!Apool || !Bpool) { free(Apool); free(Bpool); return; }
 
     #pragma omp parallel num_threads(nt)
     {
@@ -216,13 +219,13 @@ void acfun_gemm_avx512(int M, int N, int K,
         for (int mid = 0; mid < mb; ++mid) {
             int m0 = mid * MC;
             int mc = std::min(MC, M - m0);
-            packA_all(Apool.data() + (size_t)mid * MC * K, A, m0, mc, K, MC);
+            packA_all(Apool + (size_t)mid * MC * K, A, m0, mc, K, MC);
         }
         #pragma omp for schedule(dynamic, 1) nowait
         for (int nid = 0; nid < nb; ++nid) {
             int n0 = nid * NC;
             int nc = std::min(NC, N - n0);
-            packB_all(Bpool.data() + (size_t)nid * NC * K, B, n0, nc, K, NC, N);
+            packB_all(Bpool + (size_t)nid * NC * K, B, n0, nc, K, NC, N);
         }
         #pragma omp barrier
 
@@ -234,8 +237,9 @@ void acfun_gemm_avx512(int M, int N, int K,
             int m0 = mid * MC;
             int n0 = nid * NC;
             gemm_tile_packed(m0, n0, M, N, K, A, B, C, MC, NC, KC,
-                             Apool.data() + (size_t)mid * MC * K,
-                             Bpool.data() + (size_t)nid * NC * K);
+                             Apool + (size_t)mid * MC * K,
+                             Bpool + (size_t)nid * NC * K);
         }
     }
+    free(Apool); free(Bpool);
 }
