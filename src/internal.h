@@ -24,6 +24,11 @@ void acfun_gemm_avx2(int M, int N, int K,
 void acfun_gemm_avx512(int M, int N, int K,
                        const float* A, const float* B, float* C);
 
+/* Winograd F(2,3) 卷积: 3x3 / stride1 / pad1, NHWC, 支持融合 ReLU (act=1) */
+void acfun_winograd_conv3x3(const float* input, int N, int H, int W, int Cin,
+                            const float* weight, const float* bias,
+                            int Cout, float* output, int act);
+
 /* 调度器下发的期望线程数 (1 = 串行); 后端据此选择串行或 omp parallel num_threads */
 void acfun_set_num_threads_runtime(int n);
 int  acfun_get_num_threads_runtime(void);

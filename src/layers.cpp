@@ -1,5 +1,6 @@
 /* Acfun 推理层实现。卷积走 im2col + GEMM，与 MNN 的 Conv 优化路线一致。 */
 #include "acfun.h"
+#include "internal.h"
 #include <cmath>
 #include <cstring>
 #include <algorithm>
@@ -50,6 +51,14 @@ static void conv2d_impl(const float* input, int N, int H, int W, int Cin,
                         const float* weight, const float* bias,
                         int KH, int KW, int Cout, int stride, int pad,
                         float* output, int act) {
+    /* Winograd F(2,3) 快路径: 仅 3x3 / stride1 / pad1, 且通道与特征图足够大
+     * (变换开销固定, 小通道/小图下收益不明显, 回落 im2col+GEMM 更稳)。 */
+    if (KH == 3 && KW == 3 && stride == 1 && pad == 1 && H >= 3 && W >= 3
+        && Cin >= 4 && Cout >= 4) {
+        acfun_winograd_conv3x3(input, N, H, W, Cin, weight, bias, Cout, output, act);
+        return;
+    }
+
     int OH = (H + 2 * pad - KH) / stride + 1;
     int OW = (W + 2 * pad - KW) / stride + 1;
     if (OH <= 0 || OW <= 0) return;

@@ -151,12 +151,61 @@ static void bench_conv() {
     double tn = tconv(conv_naive, o1.data(), reps);
     double ta = tconv(acfun_conv2d, o2.data(), reps);
     printf("  naive 直乘 : %7.3f ms  (%6.1f img/s)\n", tn * 1e3, 1.0 / tn);
-    printf("  Acfun GEMM : %7.3f ms  (%6.1f img/s)\n", ta * 1e3, 1.0 / ta);
+    printf("  Acfun (Wino/GEMM) : %7.3f ms  (%6.1f img/s)\n", ta * 1e3, 1.0 / ta);
     printf("  加速比     : %7.1fx\n", tn / ta);
 
     /* 校验 */
     float maxd = 0; for (size_t i = 0; i < outN; ++i) maxd = std::max(maxd, std::fabs(o1[i] - o2[i]));
     printf("  max|Δ|=%9.3e %s\n", maxd, maxd < 1e-2f ? "OK" : "FAIL");
+}
+
+/* ---------- 3b) Winograd 3x3 卷积: 正确性 + 提速 ----------
+ * Winograd 路径已被 conv2d_impl 在 3x3/s1/p1 且通道>=4 时自动选用。
+ * 这里用直接卷积 (conv_naive) 作参考, 跨多种尺寸/通道/奇偶特征图严格校验
+ * 数值一致性 (容许 Winograd 域变换的浮点舍入), 并给出 112² 吞吐。 */
+static void bench_winograd() {
+    printf("\n=== Winograd F(2,3) 3x3 卷积: 正确性与加速 ===\n");
+    struct Cfg { int H, W, Cin, Cout; } cfgs[] = {
+        {112,112,16,16}, {64,64,32,32}, {57,55,24,48}, {33,31,12,20},
+        {16,16,8,8},     {113,97,16,16}, {48,48,64,16}, {24,24,4,64},
+    };
+    int fails = 0;
+    for (auto& c : cfgs) {
+        int H=c.H,W=c.W,Cin=c.Cin,Cout=c.Cout,KH=3,KW=3,st=1,pd=1,N=1;
+        if (Cin < 4 || Cout < 4) continue;   /* 仅覆盖 Winograd 实际启用区间 */
+        int OH=H, OW=W;
+        size_t inN=(size_t)N*H*W*Cin, wN=(size_t)KH*KW*Cin*Cout, outN=(size_t)N*OH*OW*Cout;
+        std::vector<float> in(inN), w(wN), b(Cout,0.1f), on(outN), ow(outN);
+        rand_fill(in.data(),inN); rand_fill(w.data(),wN);
+        conv_naive(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,on.data());
+        acfun_conv2d(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,ow.data());
+        float maxd=0; for(size_t i=0;i<outN;++i) maxd=std::max(maxd,std::fabs(on[i]-ow[i]));
+        bool ok = maxd < 1e-2f;
+        if(!ok) fails++;
+        printf("  %dx%dx%d->%d  max|Δ|=%9.3e  %s\n", H,W,Cin,Cout, maxd, ok?"OK":"FAIL");
+    }
+    /* 112² 吞吐对比 */
+    {
+        int H=112,W=112,Cin=16,Cout=16,KH=3,KW=3,st=1,pd=1,N=1,OH=H,OW=W;
+        size_t inN=(size_t)N*H*W*Cin, wN=(size_t)KH*KW*Cin*Cout, outN=(size_t)N*OH*OW*Cout;
+        std::vector<float> in(inN), w(wN), b(Cout,0.1f), o(outN);
+        rand_fill(in.data(),inN); rand_fill(w.data(),wN);
+        int reps=30;
+        double tn=0, ta=0;
+        std::vector<float> on(outN);
+        {
+            double t0=now(); for(int i=0;i<reps;++i) conv_naive(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,on.data()); tn=(now()-t0)/reps;
+        }
+        {
+            double t0=now(); for(int i=0;i<reps;++i) acfun_conv2d(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,o.data()); ta=(now()-t0)/reps;
+        }
+        float maxd=0; for(size_t i=0;i<outN;++i) maxd=std::max(maxd,std::fabs(on[i]-o[i]));
+        printf("  112²x16  naive : %7.3f ms  (%6.1f img/s)\n", tn*1e3, 1.0/tn);
+        printf("  112²x16  Wino  : %7.3f ms  (%6.1f img/s)  max|Δ|=%9.3e %s\n",
+               ta*1e3, 1.0/ta, maxd, maxd<1e-2f?"OK":"FAIL");
+        printf("  Winograd 加速  : %7.1fx\n", tn/ta);
+    }
+    printf("  %s\n", fails==0 ? "Winograd 全部通过" : "Winograd 存在失败");
 }
 
 /* ---------- 4) 端到端 ---------- */
@@ -329,6 +378,7 @@ int main(int argc, char** argv) {
     bench_gemm();
     bench_gemm_scale();
     bench_conv();
+    bench_winograd();
     const char* mp = (argc > 1) ? argv[1] : "model.acfun";
     bench_e2e(mp);
     bench_fusion(mp);

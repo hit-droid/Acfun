@@ -14,6 +14,7 @@ add_library(acfun STATIC
     src/gemm_ref.cpp
     src/gemm_avx2.cpp
     src/gemm_avx512.cpp
+    src/winograd.cpp
     src/layers.cpp
     src/model.cpp
 )

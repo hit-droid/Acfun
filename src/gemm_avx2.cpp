@@ -38,8 +38,8 @@ static const int NR = 16;
 /* 微内核: 仅处理完整 MR×NR 块。Cbase 为瓦片在 C 中的原点 (m0*ldc+n0)。 */
 static inline void kernel(const float* Ap, const float* Bp, float* Cbase, int ldc,
                           int mc, int nc, int kc, int MC, int NC, int beta) {
-    int mrR = mc - (mc & (MR - 1));
-    int nrR = nc - (nc & (NR - 1));
+    int mrR = mc - (mc % MR);
+    int nrR = nc - (nc % NR);
     for (int nn = 0; nn < nrR; nn += NR) {          /* N 外层: B 行被复用 */
         for (int mm = 0; mm < mrR; mm += MR) {      /* M 内层: 6 行 */
             __m256 c0[MR], c1[MR];                  /* 两路 8 列累加器 */
@@ -80,8 +80,8 @@ static inline void tile_tails(int m0, int n0, int M, int N, int K,
                               const float* A, const float* B, float* C,
                               int MC, int NC, int kc, int mc, int nc, int k0, int beta) {
     const int lda = K, ldb = N, ldc = N;
-    int mrR = mc - (mc & (MR - 1));
-    int nrR = nc - (nc & (NR - 1));
+    int mrR = mc - (mc % MR);
+    int nrR = nc - (nc % NR);
     auto f = beta ? acfun_gemm_ref_ld_b1 : acfun_gemm_ref_ld;
     if (mc > mrR)
         f(mc - mrR, nrR, kc, lda, ldb, ldc,
