@@ -28,6 +28,14 @@ void acfun_gemm_avx512(int M, int N, int K,
 void acfun_winograd_conv3x3(const float* input, int N, int H, int W, int Cin,
                             const float* weight, const float* bias,
                             int Cout, float* output, int act);
+/* 标量 (通用 -O3) 实现, 作为可移植兜底 */
+void acfun_winograd_conv3x3_scalar(const float* input, int N, int H, int W, int Cin,
+                                   const float* weight, const float* bias,
+                                   int Cout, float* output, int act);
+/* AVX2+FMA 变体 (编译单元带 -mavx2 -mfma): 量化/累加内层 256-bit 向量化 */
+void acfun_winograd_conv3x3_avx2(const float* input, int N, int H, int W, int Cin,
+                                 const float* weight, const float* bias,
+                                 int Cout, float* output, int act);
 
 /* 调度器下发的期望线程数 (1 = 串行); 后端据此选择串行或 omp parallel num_threads */
 void acfun_set_num_threads_runtime(int n);

@@ -46,11 +46,72 @@ static void im2col(const float* in, int H, int W, int Cin,
     }
 }
 
+/* 1x1 逐点卷积快路径: 卷积退化为 GEMM, 完全跳过 im2col 的展开/拷贝。
+ *   out[p, c] = Σ_d in[p, d] * w[d, c] + bias[c]
+ * 当 stride=1 && pad=0 时输入矩阵与输入张量同形, A 直接指向 input, 零拷贝;
+ * 仅当 stride>1 (或 pad>0) 才按需做跨步 gather 构造 A。较 im2col+GEMM 省去
+ * 一次 [OH*OW, Cin] 的完整展开拷贝, 且算术强度不变、GEMM 内核可直接复用。
+ * act=1 在写回时融合 ReLU。 */
+static void conv1x1_impl(const float* input, int N, int H, int W, int Cin,
+                         const float* weight, const float* bias,
+                         int Cout, int stride, int pad, float* output, int act) {
+    int OH = (H + 2 * pad - 1) / stride + 1;
+    int OW = (W + 2 * pad - 1) / stride + 1;
+    if (OH <= 0 || OW <= 0) return;
+    size_t pixTotal = (size_t)N * OH * OW;       /* 全部 batch 的输出像素数 */
+    size_t inPix     = (size_t)N * H * W;
+
+    /* 构造 A 矩阵 [pixTotal, Cin]: stride==1 && pad==0 时与输入同形, 直接复用 */
+    const float* Aptr = input;
+    float* Abuf = nullptr;
+    if (stride != 1 || pad != 0) {
+        Abuf = (float*)malloc(pixTotal * Cin * sizeof(float));
+        if (!Abuf) return;
+        for (size_t p = 0; p < pixTotal; ++p) {
+            int n  = (int)(p / ((size_t)OH * OW));
+            size_t rp = p % ((size_t)OH * OW);
+            int oh = (int)(rp / OW), ow = (int)(rp % OW);
+            int ih = oh * stride - pad, iw = ow * stride - pad;
+            float* dst = Abuf + p * Cin;
+            const float* src = input + (((size_t)n * H + ih) * W + iw) * Cin;
+            if (ih >= 0 && ih < H && iw >= 0 && iw < W)
+                std::memcpy(dst, src, Cin * sizeof(float));
+            else
+                std::memset(dst, 0, Cin * sizeof(float));
+        }
+        Aptr = Abuf;
+    }
+
+    float* gemm_out = (float*)malloc(pixTotal * Cout * sizeof(float));
+    if (!gemm_out) { free(Abuf); return; }
+
+    /* 整批一次性 GEMM: A[pixTotal, Cin] * W[Cin, Cout] -> gemm_out[pixTotal, Cout] */
+    acfun_gemm((int)pixTotal, Cout, Cin, Aptr, weight, gemm_out);
+
+    /* 偏置 + (可选)ReLU 融合, 单次遍历写回 NHWC 输出 */
+    for (size_t p = 0; p < pixTotal; ++p) {
+        float* yo = output + p * Cout;
+        const float* go = gemm_out + p * Cout;
+        for (int c = 0; c < Cout; ++c) {
+            float v = go[c] + (bias ? bias[c] : 0.0f);
+            if (act == 1 && v < 0.0f) v = 0.0f;
+            yo[c] = v;
+        }
+    }
+    free(Abuf);
+    free(gemm_out);
+}
+
 /* 卷积内部实现: act=0 无激活, act=1 融合 ReLU (在输出写入时就地施加, 省去额外扫描) */
 static void conv2d_impl(const float* input, int N, int H, int W, int Cin,
                         const float* weight, const float* bias,
                         int KH, int KW, int Cout, int stride, int pad,
                         float* output, int act) {
+    /* 1x1 逐点卷积: 直接 GEMM, 跳过 im2col (见 conv1x1_impl) */
+    if (KH == 1 && KW == 1) {
+        conv1x1_impl(input, N, H, W, Cin, weight, bias, Cout, stride, pad, output, act);
+        return;
+    }
     /* Winograd F(2,3) 快路径: 仅 3x3 / stride1 / pad1, 且通道与特征图足够大
      * (变换开销固定, 小通道/小图下收益不明显, 回落 im2col+GEMM 更稳)。 */
     if (KH == 3 && KW == 3 && stride == 1 && pad == 1 && H >= 3 && W >= 3

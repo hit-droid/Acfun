@@ -372,6 +372,46 @@ static void bench_conv_bn_relu_composite() {
     printf("  融合加速            : %7.1fx   max|Δ|=%9.3e %s\n", tBase/tFused, maxd, maxd<1e-3f?"OK":"FAIL");
 }
 
+/* ---------- 3b) 1x1 逐点卷积: 正确性 + 提速 ----------
+ * 1x1 卷积经 conv1x1_impl 直接走 GEMM (跳过 im2col), 与朴素直乘严格对比。 */
+static void bench_conv1x1() {
+    printf("\n=== 1x1 逐点卷积: 正确性 + 提速 (直接 GEMM 路径) ===\n");
+    struct Cfg { int H, W, Cin, Cout, st; } cfgs[] = {
+        {112,112,16,16,1}, {56,56,32,32,1}, {28,28,64,64,1},
+        {56,56,16,32,2}, {28,28,32,64,2}, {113,97,24,48,1},
+    };
+    int fails = 0;
+    for (auto& c : cfgs) {
+        int H=c.H,W=c.W,Cin=c.Cin,Cout=c.Cout,KH=1,KW=1,st=c.st,pd=0,N=1;
+        int OH=(H+2*pd-KH)/st+1, OW=(W+2*pd-KW)/st+1;
+        size_t inN=(size_t)N*H*W*Cin, wN=(size_t)KH*KW*Cin*Cout, outN=(size_t)N*OH*OW*Cout;
+        std::vector<float> in(inN), w(wN), b(Cout,0.1f), on(outN), oa(outN);
+        rand_fill(in.data(),inN); rand_fill(w.data(),wN);
+        conv_naive(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,on.data());
+        acfun_conv2d(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,oa.data());
+        float maxd=0; for(size_t i=0;i<outN;++i) maxd=std::max(maxd,std::fabs(on[i]-oa[i]));
+        bool ok = maxd < 1e-2f; if(!ok) fails++;
+        printf("  %dx%dx%d->%d s%d  max|Δ|=%9.3e  %s\n", H,W,Cin,Cout,st, maxd, ok?"OK":"FAIL");
+    }
+    /* 吞吐对比: 112²x16->16 s1 (im2col 路径已退化为直接 GEMM, 这里展示端到端) */
+    {
+        int H=112,W=112,Cin=16,Cout=16,KH=1,KW=1,st=1,pd=0,N=1,OH=H,OW=W;
+        size_t inN=(size_t)N*H*W*Cin, wN=(size_t)KH*KW*Cin*Cout, outN=(size_t)N*OH*OW*Cout;
+        std::vector<float> in(inN), w(wN), b(Cout,0.1f), o(outN);
+        rand_fill(in.data(),inN); rand_fill(w.data(),wN);
+        int reps=50;
+        double tn=0, ta=0; std::vector<float> on(outN);
+        { double t0=now(); for(int i=0;i<reps;++i) conv_naive(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,on.data()); tn=(now()-t0)/reps; }
+        { double t0=now(); for(int i=0;i<reps;++i) acfun_conv2d(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,o.data()); ta=(now()-t0)/reps; }
+        float maxd=0; for(size_t i=0;i<outN;++i) maxd=std::max(maxd,std::fabs(on[i]-o[i]));
+        printf("  112²x16->16 s1  naive : %7.3f ms  (%6.1f img/s)\n", tn*1e3, 1.0/tn);
+        printf("  Acfun 1x1    : %7.3f ms  (%6.1f img/s)  max|Δ|=%9.3e %s\n",
+               ta*1e3, 1.0/ta, maxd, maxd<1e-2f?"OK":"FAIL");
+        printf("  1x1 加速     : %7.1fx\n", tn/ta);
+    }
+    printf("  %s\n", fails==0 ? "1x1 卷积全部通过" : "1x1 卷积存在失败");
+}
+
 int main(int argc, char** argv) {
     printf("Acfun 推理引擎基准  |  后端: %s\n", acfun_backend_name());
     int fails = correctness();
@@ -382,6 +422,7 @@ int main(int argc, char** argv) {
     const char* mp = (argc > 1) ? argv[1] : "model.acfun";
     bench_e2e(mp);
     bench_fusion(mp);
+    bench_conv1x1();
     bench_conv_bn_relu_composite();
     printf("\n正确性: %s\n", fails == 0 ? "全部通过" : "存在失败");
     return fails == 0 ? 0 : 1;

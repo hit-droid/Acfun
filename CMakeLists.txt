@@ -15,6 +15,7 @@ add_library(acfun STATIC
     src/gemm_avx2.cpp
     src/gemm_avx512.cpp
     src/winograd.cpp
+    src/winograd_avx2.cpp
     src/layers.cpp
     src/model.cpp
 )
@@ -27,6 +28,7 @@ target_link_libraries(acfun PUBLIC OpenMP::OpenMP_CXX)
 # 仅 SIMD 内核携带对应指令集
 set_source_files_properties(src/gemm_avx2.cpp   PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
 set_source_files_properties(src/gemm_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma")
+set_source_files_properties(src/winograd_avx2.cpp PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
 
 add_executable(acfun_bench src/benchmark.cpp)
 target_link_libraries(acfun_bench PRIVATE acfun)

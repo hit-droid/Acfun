@@ -103,10 +103,14 @@ inline void output_transform(const float* mh, int Cout, int c, float Y[4]) {
 } /* namespace */
 
 /* Winograd F(2,3) 卷积主体: 3x3 / stride1 / pad1, NHWC。
- * 要求 H>=3 && W>=3; act=1 融合 ReLU。权重布局: w[KH*KW*Cin*Cout]。 */
-void acfun_winograd_conv3x3(const float* input, int N, int H, int W, int Cin,
-                            const float* weight, const float* bias,
-                            int Cout, float* output, int act) {
+ * 要求 H>=3 && W>=3; act=1 融合 ReLU。权重布局: w[KH*KW*Cin*Cout]。
+ *
+ * 本文件以通用 -O3 编译, 仅提供标量 (纯 SSE) 实现作为可移植兜底; 量化/累加内层
+ * 由编译器的通用向量化即可覆盖。AVX2 机器上 conv2d_impl 经运行时派发走
+ * winograd_avx2.cpp 的 256-bit 向量化变体 (见 acfun_winograd_conv3x3_avx2)。 */
+void acfun_winograd_conv3x3_scalar(const float* input, int N, int H, int W, int Cin,
+                                   const float* weight, const float* bias,
+                                   int Cout, float* output, int act) {
     const int OH = H, OW = W;                 /* s1 p1 => 输出同尺寸 */
     const int tH = (OH + 1) / 2;              /* 2x2 输出瓦片数 (向上取整) */
     const int tW = (OW + 1) / 2;
@@ -199,4 +203,18 @@ void acfun_winograd_conv3x3(const float* input, int N, int H, int W, int Cin,
             }
         }
     }
+}
+
+/* 运行时派发: AVX2 可用的机器走 256-bit 向量化变体, 否则回落标量 (纯 SSE) 实现。
+ * 这样 winograd.cpp 始终以通用指令集编译, 保证可移植; 向量化强度由独立 TU 提供。 */
+void acfun_winograd_conv3x3(const float* input, int N, int H, int W, int Cin,
+                            const float* weight, const float* bias,
+                            int Cout, float* output, int act) {
+#if defined(__GNUC__)
+    if (__builtin_cpu_supports("avx2")) {
+        acfun_winograd_conv3x3_avx2(input, N, H, W, Cin, weight, bias, Cout, output, act);
+        return;
+    }
+#endif
+    acfun_winograd_conv3x3_scalar(input, N, H, W, Cin, weight, bias, Cout, output, act);
 }
