@@ -37,6 +37,35 @@ static int physical_cores(void) {
 
 void acfun_set_threads(int n) { g_threads = n > 0 ? n : 0; }
 
+/* 生效核心数: 物理核数 与 cgroup CPU 配额的较小值。cgroup v2 读 cpu.max
+ * ("quota period", "max" 表示不限), cgroup v1 读 cpu.cfs_quota_us/period_us。
+ * 受限容器(如本机 4 核配额)下把线程上限压到配额内, 避免争抢引发的切换风暴。 */
+int acfun_effective_cores(void) {
+    int phys = physical_cores();
+    long long quota = 0;   /* 0 = 不限 */
+    FILE* f = fopen("/sys/fs/cgroup/cpu.max", "r");
+    if (f) {
+        char buf[64];
+        if (fgets(buf, sizeof(buf), f) && strncmp(buf, "max", 3) != 0) {
+            long long q = 0, p = 0;
+            if (sscanf(buf, "%lld %lld", &q, &p) == 2 && p > 0)
+                quota = (q + p - 1) / p;
+        }
+        fclose(f);
+    } else {
+        f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r");
+        long long q = 0;
+        if (f) { if (fscanf(f, "%lld", &q) == 1 && q > 0) quota = q; fclose(f); }
+        if (quota > 0) {
+            f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r");
+            long long p = 0;
+            if (f) { if (fscanf(f, "%lld", &p) == 1 && p > 0) quota = (quota + p - 1) / p; fclose(f); }
+        }
+    }
+    int eff = (quota > 0 && quota < (long long)phys) ? (int)quota : phys;
+    return eff > 0 ? eff : 1;
+}
+
 static int detect_backend(void) {
     if (g_backend) return g_backend;
 #if defined(__GNUC__)

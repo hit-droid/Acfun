@@ -1,10 +1,15 @@
 /* Acfun Winograd 卷积 AVX2+FMA 变体 (F(2,3), 3x3 / stride1 / pad1)。
  *
- * 与 winograd.cpp 的标量实现同算法, 仅把最热的「量化/累加内层」
+ * 与 winograd.cpp 标量实现同算法, 仅把最热的「量化/累加内层」
  *   m_hat[ij][c] += dh[ij] * g_hat[ij][d][c]
  * 用 256-bit AVX2 + FMA 向量化 (c 连续, 每次 8 通道)。该循环占单瓦片算力主体
  * (16·Cin·Cout MAC/瓦片, 远超输入/输出变换的 16·Cin / 16·Cout 加法), 是 Winograd
- * 路径的首要热点。AVX2 机器经 conv2d_impl 运行时派发至此。
+ * 路径的首要热点。
+ *
+ * 性能优化沿用与 AVX-512 变体一致的两层: (a) 无分支 ReLU (vmax 语义) 融合, 消除
+ * 数据相关分支惩罚; (b) 输出 2x2 瓦片并行 — 瓦片彼此独立, 对 (ty,tx) 网格做 OpenMP
+ * 并行, 每线程持私有 m_hat, g_hat(仅依赖权重, 调用内只读) 与 pad(逐图串行填充后只读)
+ * 跨线程共享; 仅大卷积 (工作量超阈值) 并行, 微型模型回落串行避免 fork/join 开销。
  *
  * 编译单元需带 -mavx2 -mfma (见 CMakeLists.txt); 仅在本函数内使用 AVX2 指令。 */
 #include "acfun.h"
@@ -77,6 +82,69 @@ inline void output_transform(const float* mh, int Cout, int c, float Y[4]) {
 
 } /* namespace */
 
+/* 单瓦片计算 (2x2 输出块): 使用调用方提供的线程私有 m_hat(16*Cout)。
+ * g_hat(仅依赖权重, 调用内只读) 与 pad(逐图串行填充后只读) 跨线程共享。 */
+static void wino_tile_avx2(int ty, int tx, int OH, int OW, int Cin, int Cout, int act,
+                           const float* bias,
+                           const float* g_hat, const float* pbase, int pstride,
+                           float* m_hat, float* output, int n) {
+    int oh0 = 2 * ty, ow0 = 2 * tx;
+    std::memset(m_hat, 0, (size_t)16 * Cout * sizeof(float));
+
+    for (int d = 0; d < Cin; ++d) {
+        int pr0 = 2 * ty, pc0 = 2 * tx;
+        float dblock[16];
+        for (int k = 0; k < 4; ++k) {
+            int pr = pr0 + k;
+            const float* prow = (pr >= 0 && pr < OH + 2)
+                ? &pbase[(size_t)pr * pstride] : nullptr;
+            for (int l = 0; l < 4; ++l) {
+                int pc = pc0 + l;
+                if (prow && pc >= 0 && pc < OW + 2)
+                    dblock[k * 4 + l] = prow[(size_t)pc * Cin + d];
+                else
+                    dblock[k * 4 + l] = 0.0f;
+            }
+        }
+        float dh[16];
+        input_transform(dblock, dh);
+
+        /* 量化/累加内层: 256-bit AVX2 向量化 (c 连续, 每次 8 通道) */
+        for (int ij = 0; ij < 16; ++ij) {
+            const float* gh = &g_hat[((size_t)ij * Cin + d) * Cout];
+            float*       mh = &m_hat[(size_t)ij * Cout];
+            float        v  = dh[ij];
+            __m256 vv = _mm256_set1_ps(v);
+            int c = 0;
+            for (; c + 8 <= Cout; c += 8) {
+                __m256 gv = _mm256_loadu_ps(gh + c);
+                __m256 mv = _mm256_loadu_ps(mh + c);
+                _mm256_storeu_ps(mh + c, _mm256_fmadd_ps(vv, gv, mv));
+            }
+            for (; c < Cout; ++c) mh[c] += v * gh[c];
+        }
+    }
+
+    /* 输出变换 Y = AT M ATᵀ, 写回 2x2 输出并融合 bias/ReLU (无分支 vmax) */
+    float* yo = output + (size_t)n * OH * OW * Cout;
+    for (int c = 0; c < Cout; ++c) {
+        float Y[4];
+        output_transform(m_hat, Cout, c, Y);
+        float b = bias ? bias[c] : 0.0f;
+        for (int r = 0; r < 2; ++r) {
+            int oh = oh0 + r;
+            if (oh >= OH) continue;
+            for (int cc = 0; cc < 2; ++cc) {
+                int ow = ow0 + cc;
+                if (ow >= OW) continue;
+                float v = Y[r * 2 + cc] + b;
+                if (act == 1) v = v < 0.0f ? 0.0f : v;
+                yo[(size_t)(oh * OW + ow) * Cout + c] = v;
+            }
+        }
+    }
+}
+
 void acfun_winograd_conv3x3_avx2(const float* input, int N, int H, int W, int Cin,
                                  const float* weight, const float* bias,
                                  int Cout, float* output, int act) {
@@ -84,6 +152,7 @@ void acfun_winograd_conv3x3_avx2(const float* input, int N, int H, int W, int Ci
     const int tH = (OH + 1) / 2;
     const int tW = (OW + 1) / 2;
 
+    /* 预计算变换后权重 g_hat[16][Cin][Cout] (内层 c 连续), 调用内只读共享。 */
     std::vector<float> g_hat((size_t)16 * Cin * Cout);
     for (int d = 0; d < Cin; ++d) {
         for (int c = 0; c < Cout; ++c) {
@@ -97,9 +166,14 @@ void acfun_winograd_conv3x3_avx2(const float* input, int N, int H, int W, int Ci
         }
     }
 
-    std::vector<float> m_hat((size_t)16 * Cout);
     std::vector<float> pad((size_t)(H + 2) * (W + 2) * Cin);
     const int pstride = (W + 2) * Cin;
+
+    const long long work = (long long)Cin * Cout * OH * OW;
+    const int PARALLEL = (work >= 8000000LL);
+    int nth = acfun_effective_cores();
+    if (nth > tH * tW) nth = tH * tW;
+    if (nth < 1) nth = 1;
 
     for (int n = 0; n < N; ++n) {
         const float* x = input + (size_t)n * H * W * Cin;
@@ -109,64 +183,25 @@ void acfun_winograd_conv3x3_avx2(const float* input, int N, int H, int W, int Ci
                 memcpy(&pad[((size_t)(ih + 1) * (W + 2) + (iw + 1)) * Cin],
                        x + ((size_t)ih * W + iw) * Cin, Cin * sizeof(float));
         const float* pbase = pad.data();
-        for (int ty = 0; ty < tH; ++ty) {
-            int oh0 = 2 * ty;
-            for (int tx = 0; tx < tW; ++tx) {
-                int ow0 = 2 * tx;
-                std::memset(m_hat.data(), 0, (size_t)16 * Cout * sizeof(float));
 
-                for (int d = 0; d < Cin; ++d) {
-                    int pr0 = 2 * ty, pc0 = 2 * tx;
-                    float dblock[16];
-                    for (int k = 0; k < 4; ++k) {
-                        int pr = pr0 + k;
-                        const float* prow = (pr >= 0 && pr < H + 2)
-                            ? &pbase[(size_t)pr * pstride] : nullptr;
-                        for (int l = 0; l < 4; ++l) {
-                            int pc = pc0 + l;
-                            if (prow && pc >= 0 && pc < W + 2)
-                                dblock[k * 4 + l] = prow[(size_t)pc * Cin + d];
-                            else
-                                dblock[k * 4 + l] = 0.0f;
-                        }
-                    }
-                    float dh[16];
-                    input_transform(dblock, dh);
-
-                    /* 量化/累加内层: 256-bit AVX2 向量化 (c 连续, 每次 8 通道) */
-                    for (int ij = 0; ij < 16; ++ij) {
-                        const float* gh = &g_hat[((size_t)ij * Cin + d) * Cout];
-                        float*       mh = &m_hat[(size_t)ij * Cout];
-                        float        v  = dh[ij];
-                        __m256 vv = _mm256_set1_ps(v);
-                        int c = 0;
-                        for (; c + 8 <= Cout; c += 8) {
-                            __m256 gv = _mm256_loadu_ps(gh + c);
-                            __m256 mv = _mm256_loadu_ps(mh + c);
-                            _mm256_storeu_ps(mh + c, _mm256_fmadd_ps(vv, gv, mv));
-                        }
-                        for (; c < Cout; ++c) mh[c] += v * gh[c];
-                    }
-                }
-
-                float* yo = output + (size_t)n * OH * OW * Cout;
-                for (int c = 0; c < Cout; ++c) {
-                    float Y[4];
-                    output_transform(m_hat.data(), Cout, c, Y);
-                    float b = bias ? bias[c] : 0.0f;
-                    for (int r = 0; r < 2; ++r) {
-                        int oh = oh0 + r;
-                        if (oh >= OH) continue;
-                        for (int cc = 0; cc < 2; ++cc) {
-                            int ow = ow0 + cc;
-                            if (ow >= OW) continue;
-                            float v = Y[r * 2 + cc] + b;
-                            if (act == 1 && v < 0.0f) v = 0.0f;
-                            yo[(size_t)(oh * OW + ow) * Cout + c] = v;
-                        }
-                    }
-                }
+        if (PARALLEL) {
+            #pragma omp parallel num_threads(nth)
+            {
+                std::vector<float> m_hat((size_t)16 * Cout);
+                #pragma omp for collapse(2) schedule(static)
+                for (int ty = 0; ty < tH; ++ty)
+                    for (int tx = 0; tx < tW; ++tx)
+                        wino_tile_avx2(ty, tx, OH, OW, Cin, Cout, act, bias,
+                                       g_hat.data(), pbase, pstride,
+                                       m_hat.data(), output, n);
             }
+        } else {
+            std::vector<float> m_hat((size_t)16 * Cout);
+            for (int ty = 0; ty < tH; ++ty)
+                for (int tx = 0; tx < tW; ++tx)
+                    wino_tile_avx2(ty, tx, OH, OW, Cin, Cout, act, bias,
+                                   g_hat.data(), pbase, pstride,
+                                   m_hat.data(), output, n);
         }
     }
 }

@@ -36,10 +36,20 @@ void acfun_winograd_conv3x3_scalar(const float* input, int N, int H, int W, int 
 void acfun_winograd_conv3x3_avx2(const float* input, int N, int H, int W, int Cin,
                                  const float* weight, const float* bias,
                                  int Cout, float* output, int act);
+/* AVX-512+FMA 变体 (编译单元带 -mavx512f -mfma): 512-bit 量化/累加 + 寄存器驻留
+ * 累加 (c 维 16 路分块, 跨全部 d 仅写回 m_hat 一次), 较 AVX2 翻倍通道吞吐。 */
+void acfun_winograd_conv3x3_avx512(const float* input, int N, int H, int W, int Cin,
+                             const float* weight, const float* bias,
+                             int Cout, float* output, int act);
 
 /* 调度器下发的期望线程数 (1 = 串行); 后端据此选择串行或 omp parallel num_threads */
 void acfun_set_num_threads_runtime(int n);
 int  acfun_get_num_threads_runtime(void);
+
+/* 生效核心数: 取物理核数与 cgroup CPU 配额(cpu.max / cfs_quota)的较小值,
+ * 避免多线程在受限容器内争抢导致上下文切换风暴 (例如 16 线程抢 4 核配额)。
+ * 无 cgroup 限制时回退物理核数。供 GEMM/卷积并行区设置 num_threads 上限。 */
+int acfun_effective_cores(void);
 
 #ifdef __cplusplus
 }

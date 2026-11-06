@@ -102,6 +102,62 @@ inline void output_transform(const float* mh, int Cout, int c, float Y[4]) {
 
 } /* namespace */
 
+/* 单瓦片计算 (2x2 输出块): 使用调用方提供的线程私有 m_hat(16*Cout)。
+ * g_hat(仅依赖权重, 调用内只读) 与 pad(逐图串行填充后只读) 跨线程共享。 */
+static void wino_tile_scalar(int ty, int tx, int OH, int OW, int Cin, int Cout, int act,
+                             const float* bias,
+                             const float* g_hat, const float* pbase, int pstride,
+                             float* m_hat, float* output, int n) {
+    int oh0 = 2 * ty, ow0 = 2 * tx;
+    std::memset(m_hat, 0, (size_t)16 * Cout * sizeof(float));
+
+    for (int d = 0; d < Cin; ++d) {
+        int pr0 = 2 * ty, pc0 = 2 * tx;
+        float dblock[16];
+        for (int k = 0; k < 4; ++k) {
+            int pr = pr0 + k;
+            const float* prow = (pr >= 0 && pr < OH + 2)
+                ? &pbase[(size_t)pr * pstride] : nullptr;
+            for (int l = 0; l < 4; ++l) {
+                int pc = pc0 + l;
+                if (prow && pc >= 0 && pc < OW + 2)
+                    dblock[k * 4 + l] = prow[(size_t)pc * Cin + d];
+                else
+                    dblock[k * 4 + l] = 0.0f;
+            }
+        }
+        float dh[16];
+        input_transform(dblock, dh);
+
+        /* m_hat[ij][c] += dh[ij] * g_hat[ij][d][c] (c 连续) */
+        for (int ij = 0; ij < 16; ++ij) {
+            const float* gh = &g_hat[((size_t)ij * Cin + d) * Cout];
+            float*       mh = &m_hat[(size_t)ij * Cout];
+            float        v  = dh[ij];
+            for (int c = 0; c < Cout; ++c) mh[c] += v * gh[c];
+        }
+    }
+
+    /* 输出变换 Y = AT M ATᵀ, 写回 2x2 输出并融合 bias/ReLU (无分支 vmax) */
+    float* yo = output + (size_t)n * OH * OW * Cout;
+    for (int c = 0; c < Cout; ++c) {
+        float Y[4];
+        output_transform(m_hat, Cout, c, Y);
+        float b = bias ? bias[c] : 0.0f;
+        for (int r = 0; r < 2; ++r) {
+            int oh = oh0 + r;
+            if (oh >= OH) continue;
+            for (int cc = 0; cc < 2; ++cc) {
+                int ow = ow0 + cc;
+                if (ow >= OW) continue;
+                float v = Y[r * 2 + cc] + b;
+                if (act == 1) v = v < 0.0f ? 0.0f : v;
+                yo[(size_t)(oh * OW + ow) * Cout + c] = v;
+            }
+        }
+    }
+}
+
 /* Winograd F(2,3) 卷积主体: 3x3 / stride1 / pad1, NHWC。
  * 要求 H>=3 && W>=3; act=1 融合 ReLU。权重布局: w[KH*KW*Cin*Cout]。
  *
@@ -130,12 +186,17 @@ void acfun_winograd_conv3x3_scalar(const float* input, int N, int H, int W, int 
         }
     }
 
-    std::vector<float> m_hat((size_t)16 * Cout);   /* 当前瓦片的输出域累加 */
-
     /* 带 1 像素 0 填充的输入缓冲 (尺寸 (H+2)x(W+2)xCin), 边界瓦片越界读取
      * 自然为 0, 简化裁剪逻辑并保证正确性。每个 batch 项按需重建。 */
     std::vector<float> pad((size_t)(H + 2) * (W + 2) * Cin);
     const int pstride = (W + 2) * Cin;
+
+    /* 仅大卷积并行: 避免微型模型 (e2e 32x32 等) 的 OpenMP fork/join 开销拖累延迟。 */
+    const long long work = (long long)Cin * Cout * OH * OW;
+    const int PARALLEL = (work >= 8000000LL);
+    int nth = acfun_effective_cores();
+    if (nth > tH * tW) nth = tH * tW;
+    if (nth < 1) nth = 1;
 
     for (int n = 0; n < N; ++n) {
         const float* x = input + (size_t)n * H * W * Cin;
@@ -146,72 +207,42 @@ void acfun_winograd_conv3x3_scalar(const float* input, int N, int H, int W, int 
                 memcpy(&pad[((size_t)(ih + 1) * (W + 2) + (iw + 1)) * Cin],
                        x + ((size_t)ih * W + iw) * Cin, Cin * sizeof(float));
         const float* pbase = pad.data();
-        /* 逐瓦片处理; 边界瓦片越界读取经 pad 缓冲得到 0, 输出写回时按 OH/OW 裁剪 */
-        for (int ty = 0; ty < tH; ++ty) {
-            int oh0 = 2 * ty;                 /* 瓦片输出行起点 (pad 缓冲行 2*ty..2*ty+3) */
-            for (int tx = 0; tx < tW; ++tx) {
-                int ow0 = 2 * tx;
-                std::memset(m_hat.data(), 0, (size_t)16 * Cout * sizeof(float));
 
-                /* 沿输入通道累加进输出域 */
-                for (int d = 0; d < Cin; ++d) {
-                    /* 提取 4x4 输入块 (pad 缓冲), 起始 pad 行 = 2*ty, 起始 pad 列 = 2*tx */
-                    int pr0 = 2 * ty, pc0 = 2 * tx;
-                    float dblock[16];
-                    for (int k = 0; k < 4; ++k) {
-                        int pr = pr0 + k;
-                        const float* prow = (pr >= 0 && pr < H + 2)
-                            ? &pbase[(size_t)pr * pstride] : nullptr;
-                        for (int l = 0; l < 4; ++l) {
-                            int pc = pc0 + l;
-                            if (prow && pc >= 0 && pc < W + 2)
-                                dblock[k * 4 + l] = prow[(size_t)pc * Cin + d];
-                            else
-                                dblock[k * 4 + l] = 0.0f;
-                        }
-                    }
-                    float dh[16];
-                    input_transform(dblock, dh);
-
-                    /* m_hat[ij][c] += dh[ij] * g_hat[ij][d][c] (c 连续) */
-                    for (int ij = 0; ij < 16; ++ij) {
-                        const float* gh = &g_hat[((size_t)ij * Cin + d) * Cout];
-                        float*       mh = &m_hat[(size_t)ij * Cout];
-                        float        v  = dh[ij];
-                        for (int c = 0; c < Cout; ++c) mh[c] += v * gh[c];
-                    }
-                }
-
-                /* 输出变换 Y = AT M ATᵀ (M = m_hat[c]), 写回 2x2 输出并融合 bias/ReLU */
-                float* yo = output + (size_t)n * OH * OW * Cout;
-                for (int c = 0; c < Cout; ++c) {
-                    float Y[4];
-                    output_transform(m_hat.data(), Cout, c, Y);  /* M 列主序: m[i*4+j] = m_hat[i*Cout+j] */
-                    float b = bias ? bias[c] : 0.0f;
-                    for (int r = 0; r < 2; ++r) {
-                        int oh = oh0 + r;
-                        if (oh >= OH) continue;
-                        for (int cc = 0; cc < 2; ++cc) {
-                            int ow = ow0 + cc;
-                            if (ow >= OW) continue;
-                            float v = Y[r * 2 + cc] + b;
-                            if (act == 1 && v < 0.0f) v = 0.0f;
-                            yo[(size_t)(oh * OW + ow) * Cout + c] = v;
-                        }
-                    }
-                }
+        if (PARALLEL) {
+            #pragma omp parallel num_threads(nth)
+            {
+                std::vector<float> m_hat((size_t)16 * Cout);
+                #pragma omp for collapse(2) schedule(static)
+                for (int ty = 0; ty < tH; ++ty)
+                    for (int tx = 0; tx < tW; ++tx)
+                        wino_tile_scalar(ty, tx, OH, OW, Cin, Cout, act, bias,
+                                        g_hat.data(), pbase, pstride,
+                                        m_hat.data(), output, n);
             }
+        } else {
+            std::vector<float> m_hat((size_t)16 * Cout);
+            for (int ty = 0; ty < tH; ++ty)
+                for (int tx = 0; tx < tW; ++tx)
+                    wino_tile_scalar(ty, tx, OH, OW, Cin, Cout, act, bias,
+                                    g_hat.data(), pbase, pstride,
+                                    m_hat.data(), output, n);
         }
     }
 }
 
-/* 运行时派发: AVX2 可用的机器走 256-bit 向量化变体, 否则回落标量 (纯 SSE) 实现。
- * 这样 winograd.cpp 始终以通用指令集编译, 保证可移植; 向量化强度由独立 TU 提供。 */
+/* 运行时派发: 优先 AVX-512F (512-bit FMA, 寄存器驻留累加), 其次 AVX2 (256-bit),
+ * 否则标量 (SSE) 回退。winograd.cpp 始终以通用指令集编译, 保证可移植;
+ * 向量化强度由运行时后端 + 独立 TU (winograd_avx512.cpp / winograd_avx2.cpp) 提供。 */
 void acfun_winograd_conv3x3(const float* input, int N, int H, int W, int Cin,
                             const float* weight, const float* bias,
                             int Cout, float* output, int act) {
-#if defined(__GNUC__)
-    if (__builtin_cpu_supports("avx2")) {
+#if defined(__x86_64__) || defined(_M_X64)
+    int b = acfun_backend();
+    if (b == 1) {                       /* AVX-512F */
+        acfun_winograd_conv3x3_avx512(input, N, H, W, Cin, weight, bias, Cout, output, act);
+        return;
+    }
+    if (b == 2 || __builtin_cpu_supports("avx2")) {
         acfun_winograd_conv3x3_avx2(input, N, H, W, Cin, weight, bias, Cout, output, act);
         return;
     }
