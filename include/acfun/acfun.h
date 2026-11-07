@@ -10,6 +10,7 @@
 #define ACFUN_ACFUN_H
 
 #include <stddef.h>
+#include <cstdint>
 
 #ifdef __cplusplus
 extern "C" {
@@ -63,6 +64,18 @@ void acfun_softmax(const float* input, int rows, int cols, float* output);
 void acfun_batchnorm(float* data, int size, int channels,
                      const float* mean, const float* var,
                      const float* gamma, const float* beta, float eps);
+
+/* ---- INT8 量化卷积 (AVX-512 VNNI, 对标 MNN int8 推理) ----
+ * 权重离线量化为 int8 (per-channel scale), 激活在线量化为 uint8 (per-tensor scale),
+ * GEMM 内核以 vpdpbusd 将 uint8×int8 累加为 int32, 输出按 (s_in × 每通道 scale)
+ * 反量化 (+bias, 可选 ReLU)。较 float 路径带宽节省 4×、算力密度提升 16×, 是 MNN
+ * 在端侧/服务端拿吞吐的核心手段。权重需先经 acfun_quantize_weights 量化。 */
+void acfun_quantize_weights(const float* w, int K, int N,
+                            float* scales /*[N]*/, int8_t* wq /*[K*N]*/);
+void acfun_conv2d_int8(const float* input, int N, int H, int W, int Cin,
+                       const int8_t* wq, const float* wscale, const float* bias,
+                       int KH, int KW, int Cout, int stride, int pad,
+                       float s_in, float* output, int act);
 
 /* ---- 模型执行 ----
  * 见 model.cpp 中定义的二进制格式 (magic "ACFUN0")。

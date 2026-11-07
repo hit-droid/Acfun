@@ -1,6 +1,7 @@
 #pragma once
 /* Acfun 内部接口声明 (不对外暴露) */
 #include <cstddef>
+#include <cstdint>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -45,6 +46,20 @@ void acfun_winograd_conv3x3_avx512(const float* input, int N, int H, int W, int 
 /* 调度器下发的期望线程数 (1 = 串行); 后端据此选择串行或 omp parallel num_threads */
 void acfun_set_num_threads_runtime(int n);
 int  acfun_get_num_threads_runtime(void);
+
+/* ---- INT8 量化 GEMM (对标 MNN int8 推理): A=uint8, B=int8, C=int32 累加 ----
+ * 由 gemm_int8.cpp 调度器按 CPU 特性派发到 VNNI 后端或标量参考。 */
+void acfun_gemm_int8(int M, int N, int K,
+                     const uint8_t* A, const int8_t* B, int32_t* C);
+/* 标量参考 (正确性基线), 含带主维度的变体用于尾部余数子块 (beta=0, C 被覆盖) */
+void acfun_gemm_int8_ref(int M, int N, int K,
+                         const uint8_t* A, const int8_t* B, int32_t* C);
+void acfun_gemm_int8_ref_ld(int M, int N, int K,
+                            int ldA, int ldB, int ldC,
+                            const uint8_t* A, const int8_t* B, int32_t* C);
+/* AVX-512 VNNI 后端 (编译单元带 -mavx512f -mfma -mavx512vnni) */
+void acfun_gemm_int8_avx512(int M, int N, int K,
+                            const uint8_t* A, const int8_t* B, int32_t* C);
 
 /* 生效核心数: 取物理核数与 cgroup CPU 配额(cpu.max / cfs_quota)的较小值,
  * 避免多线程在受限容器内争抢导致上下文切换风暴 (例如 16 线程抢 4 核配额)。

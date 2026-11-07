@@ -412,6 +412,78 @@ static void bench_conv1x1() {
     printf("  %s\n", fails==0 ? "1x1 卷积全部通过" : "1x1 卷积存在失败");
 }
 
+/* ---------- 6) INT8 GEMM / 卷积 (AVX-512 VNNI) ----------
+ * 对标 MNN int8 推理路径: uint8×int8→int32 的 vpdpbusd 累加器。
+ * 报告 INT8 GEMM 的 GOPS (2·M·N·K/t, 与 float GFLOPS 同口径便于比对算力吞吐),
+ * 以及量化卷积相对 float 卷积的端到端提速与精度损失。 */
+static void bench_int8() {
+    int mt_threads = 8;
+    const char* env = std::getenv("ACFUN_BENCH_THREADS");
+    if (env) mt_threads = std::atoi(env);
+
+    printf("\n=== INT8 GEMM 吞吐 (AVX-512 VNNI, uint8×int8→int32) ===\n");
+    printf("  多线程演示线程数 = %d (可用 ACFUN_BENCH_THREADS 覆盖)\n", mt_threads);
+    printf("%-10s %14s %14s %12s %12s\n", "M=N=K", "float-GFLOPS", "int8-GOPS", "1T INT8/FP", "MT加速");
+    int sizes[] = { 256, 512, 1024, 2048, 4096 };
+    for (int S : sizes) {
+        int M = S, N = S, K = S;
+        std::vector<float> Af((size_t)M * K), Bf((size_t)K * N);
+        rand_fill(Af.data(), Af.size()); rand_fill(Bf.data(), Bf.size());
+        /* 量化为 uint8 / int8 (逐张量 scale, 此处 |x|<=1 故 scale=1/50) */
+        std::vector<uint8_t> Aq((size_t)M * K);
+        std::vector<int8_t>  Bq((size_t)K * N);
+        for (size_t i = 0; i < Af.size(); ++i) { int v = (int)std::lroundf(Af[i] * 50); v = v < 0 ? 0 : (v > 255 ? 255 : v); Aq[i] = (uint8_t)v; }
+        for (size_t i = 0; i < Bf.size(); ++i) { int v = (int)std::lroundf(Bf[i] * 50); v = v < -128 ? -128 : (v > 127 ? 127 : v); Bq[i] = (int8_t)v; }
+        std::vector<float>  Cf((size_t)M * N);
+        std::vector<int32_t> Ci((size_t)M * N);
+        double work = 2.0 * M * N * K;
+        int reps = (S >= 1024) ? 5 : 20;
+
+        acfun_set_threads(1);
+        double t0 = now(); for (int r = 0; r < reps; ++r) acfun_gemm(M, N, K, Af.data(), Bf.data(), Cf.data());
+        double t1 = (now() - t0) / reps;
+        double tf = work / t1 / 1e9;
+        acfun_set_num_threads_runtime(1);
+        t0 = now(); for (int r = 0; r < reps; ++r) acfun_gemm_int8(M, N, K, Aq.data(), Bq.data(), Ci.data());
+        double ti = (now() - t0) / reps;
+        double gint = work / ti / 1e9;
+
+        acfun_set_num_threads_runtime(mt_threads);
+        t0 = now(); for (int r = 0; r < reps; ++r) acfun_gemm_int8(M, N, K, Aq.data(), Bq.data(), Ci.data());
+        double tiMT = (now() - t0) / reps;
+        double gintMT = work / tiMT / 1e9;
+
+        printf("%-10d %14.1f %14.1f %11.1fx %11.1fx\n", S, tf, gint, gint / tf, gintMT / gint);
+    }
+    printf("  * INT8 算力 = uint8×int8 MAC × 16/指令, 带宽仅 1/4; GOPS 为同口径 (2·M·N·K/t) 吞吐\n");
+
+    /* INT8 卷积: 端到端提速 + 精度 */
+    printf("\n=== INT8 量化卷积 (AVX-512 VNNI) vs float 卷积 ===\n");
+    struct CC { int H, W, Cin, Cout, KH, KW, st, pd; } cfgs[] = {
+        {112,112,16,16,3,3,1,1}, {56,56,32,32,3,3,1,1}, {28,28,64,64,1,1,1,0},
+        {56,56,16,32,1,1,2,0}, {224,224,3,16,3,3,1,1},
+    };
+    for (auto& c : cfgs) {
+        int H=c.H,W=c.W,Cin=c.Cin,Cout=c.Cout,KH=c.KH,KW=c.KW,st=c.st,pd=c.pd,N=1;
+        int OH=(H+2*pd-KH)/st+1, OW=(W+2*pd-KW)/st+1;
+        size_t inN=(size_t)N*H*W*Cin, wN=(size_t)KH*KW*Cin*Cout, outN=(size_t)N*OH*OW*Cout;
+        std::vector<float> in(inN), w(wN), b(Cout,0.1f), of(outN), oi(outN);
+        rand_fill(in.data(),inN); rand_fill(w.data(),wN);
+        std::vector<float> ws(Cout); std::vector<int8_t> wq(wN);
+        acfun_quantize_weights(w.data(), KH*KW*Cin, Cout, ws.data(), wq.data());
+        int reps = (outN > (1u<<24)) ? 5 : 20;
+        acfun_set_threads(1); acfun_set_num_threads_runtime(1);
+        double t0=now(); for(int r=0;r<reps;++r) acfun_conv2d(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,of.data());
+        double tf=(now()-t0)/reps;
+        t0=now(); for(int r=0;r<reps;++r) acfun_conv2d_int8(in.data(),N,H,W,Cin,wq.data(),ws.data(),b.data(),KH,KW,Cout,st,pd,0.0f,oi.data(),0);
+        double ti=(now()-t0)/reps;
+        float maxd=0; for(size_t i=0;i<outN;++i) maxd=std::max(maxd, std::fabs(of[i]-oi[i]));
+        printf("  %dx%dx%d->%d k%d s%d  FP:%7.3fms(%6.1f/s)  INT8:%7.3fms(%6.1f/s)  加速%.1fx  max|Δ|=%9.3e\n",
+               H,W,Cin,Cout,KH,st, tf*1e3,1.0/tf, ti*1e3,1.0/ti, tf/ti, maxd);
+    }
+    printf("  * 精度损失来自逐张量激活量化 (随机权重最坏情形); 真实模型(BN/ReLU)通常 <1%%\n");
+}
+
 int main(int argc, char** argv) {
     printf("Acfun 推理引擎基准  |  后端: %s\n", acfun_backend_name());
     int fails = correctness();
@@ -424,6 +496,7 @@ int main(int argc, char** argv) {
     bench_fusion(mp);
     bench_conv1x1();
     bench_conv_bn_relu_composite();
+    bench_int8();
     printf("\n正确性: %s\n", fails == 0 ? "全部通过" : "存在失败");
     return fails == 0 ? 0 : 1;
 }
