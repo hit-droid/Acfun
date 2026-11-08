@@ -302,10 +302,51 @@ stride>1/pad>0 仅做一次跨步 gather 构造 `A`。较朴素直乘（同尺�
 > 完成 **4 个 MAC**——折算到**真实 MAC 吞吐**，INT8 实为 float 的 **~1.3×**（`90 GMAC/s` vs float 的
 > `68 GMAC/s`），且带宽占用仅 1/4。这正是 MNN 优先 int8 推理的根本原因。
 >
-> **诚实边界（卷积路径）**：当前 INT8 卷积经 `im2col + INT8 GEMM` 实现，3×3 卷积端到端为 float 路径的
-> **0.1–0.2×**——float 卷积已自动走 `AVX-512 Winograd`（~476 img/s，乘法量 2.25× 更少），而 INT8 尚无
-> Winograd 路径。补齐 **INT8 Winograd**（或 im2col+INT8 GEMM 的打包融合）是关闭卷积差距、真正“比肩 MNN”
-> 的下一里程碑，路线明确。
+> **诚实边界已收敛（卷积路径）**：INT8 卷积此前经 `im2col + INT8 GEMM` 实现，3×3 端到端仅为 float 路径的
+> **0.1–0.2×**；现已补齐 **INT8 Winograd 快路径**（见下一节），3×3 提速约 5–10×，现整体逼近 float 卷积本体
+> （0.6–1.2×，大通道已反超），与 MNN 的 int8 卷积手段同构。剩余差距主要在极小通道（Cin≤16）下仍是整数乘加
+> 较 float 单 FMA 的固有指令数劣势，非正确性或架构缺陷。
+
+### 本轮新增：INT8 Winograd 3×3 卷积（整数域 F(2,3)，对标 MNN int8 卷积核心手段）
+
+补齐 MNN 在 x86 端吃 int8 吞吐的关键手段——3×3 专用 Winograd 整数快速卷积。新增
+`src/winograd_int8.cpp`（`-mavx512f -mavx512bw -mfma` 独立编译单元），由 `conv_int8.cpp` 在
+`KH=KW=3 && stride=1 && pad=1` 且 `Cin≥4 && Cout≥4` 且检测到 `avx512f` 时**自动路由**，否则回落
+`im2col + INT8 GEMM`。与 float Winograd **同构**，但全程在整数域完成：
+
+- **算法**：每 2×2 输出块（依赖 4×4 输入块 + 3×3 权）乘法量从 `9·Cin·Cout·4` 降到 `16·Cin·Cout`
+  （**理论乘法减少 2.25×**），并**完全跳过 im2col 展开**。输入 `d_hat = BT·d·BTᵀ`、权重 `g_hat2 = round(G̃·g·G̃ᵀ)`
+  （`G̃=2G` 消除 0.5 小数，携带 ×4 缩放）、输出 `Y = (s_in·s_w/4)·(AT·T4·ATᵀ)` 三段均可分离、无新增乘法；
+  由 Winograd 线性性，与同口径 float 卷积在「int8 量化」意义下严格等价（仅 `g_hat2` 的 ×4 取整引入微小误差）。
+- **整数域量化**：逐张量激活量化（`uint8`，零点 `zp=128`）+ 逐通道权重量化（`int8`，scale），零点偏置校正
+  并入 `bias`；输出反量化 `×s_in×s_w/4` 还原 float。零填充在 uint8 域必须为零点 `zp=128`（反量化恰还原
+  float 0），否则边缘会被错读成 `−s_in·128` 而污染全部输出（此为早期数值错误的根因）。
+- **AVX-512 内核（与 float Winograd-AVX512 同构的寄存器驻留 + 输出分块，但用 `vpmaddwd` 融合乘加）**：
+  1. **512-bit 向量化**：主乘累加 `T4[ij][o]=Σ_c dh[c]·g[c][o]` 是沿 `c` 的点积，`vpmaddwd`（512-bit）单指令
+     完成 16 路 int16×int16→int32 融合乘加，与 float 单 FMA 同量级指令数；
+  2. **寄存器驻留累加**：输出通道 `o` 16 路分块，每个 o 块用 16 个 zmm 累加器 `acc[ij]` 跨全部输入通道 `c`
+     累加、仅末了写回 `T4` 一次；对固定 `(ij,c)`，`dh` 广播在 16 路 o 块内复用，彻底消除「每 (ij,o) 重读整条
+     `dh[]`」的冗余访存；`g_hat2` 采用 `[ij][pair][2·o+(c&1)]` 交错布局，一次 512-bit load 即取回某 (c,c+1)
+     对在 16 个 o 上的交错值，以 `(dh[c],dh[c+1])` 打包广播作乘子，`vpmaddwd` 单指令完成 2 个 c 的乘累加；
+  3. **瓦片并行**：输出 2×2 瓦片彼此独立，对 `(ty,tx)` 网格做 OpenMP 并行，`g_hat2`/`Sgh`（权重相关、只读）
+     与 `pad`（逐图串行填充后只读）跨线程共享；小卷积回落串行避免 fork/join 开销。
+- **正确性**：与朴素 float 卷积逐元素一致，**跨 7 组尺寸/通道 `max|Δ|/范数 < 0.6%`**（逐张量激活量化固有误差，
+  真实模型 BN/ReLU 通常 <1%），全部 OK。
+
+> **实测（沙箱 AVX-512 Zen5，单线程，INT8 Winograd vs float 卷积本体）**：
+> | 配置 | FP | INT8 | 加速 |
+> |------|----|------|------|
+> | 112² × 16→16 | 1.98 ms | 3.40 ms | **0.6×** |
+> | 56² × 32→32 | 1.61 ms | 1.86 ms | **0.9×** |
+> | 28² × 64→64 | 1.90 ms | 1.56 ms | **1.2×** |
+> | 64² × 32→64 | 1.50 ms | 1.59 ms | **0.9×** |
+> | 113×97 × 16→48 | 1.25 ms | 2.08 ms | **0.6×** |
+> | 48² × 64→16 | 1.30 ms | 1.68 ms | **0.8×** |
+> | 24² × 8→64 | 0.41 ms | 0.49 ms | **0.8×** |
+>
+> 较此前 INT8 卷积走 `im2col+INT8 GEMM`（3×3 仅 0.1–0.2× float）**提速约 5–10×**，现整体逼近 float 卷积
+> 本体（0.6–1.2×，大通道已反超）。极小通道（Cin≤16）下仍是整数乘加较 float 单 FMA 的固有指令数劣势，
+> 非正确性或架构缺陷。
 
 ---
 
@@ -320,14 +361,15 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   ~6.5×）**、**二维 (M×N) 瓦片并行 + 自适应分块 + 内存带宽受限兜底**、序列化模型、
   **Conv/BN/ReLU 算子融合（无分支 ReLU 融合，较分离路径 1.2×）**、**L2 感知自动分块**、正确性校验（含非整除边界）、
   **INT8 GEMM（AVX-512 VNNI `vpdpbusd`，`max|Δ|=0` 对标标量参考，~90 GOPS / MT 加速 1.7–6.5×）**、
-  **INT8 量化卷积（`im2col+INT8 GEMM` + 零点偏置校正，随机权重最坏情形相对误差 <8%，真实模型通常 <1%）**。
+  **INT8 量化卷积（`im2col+INT8 GEMM` + 零点偏置校正，随机权重最坏情形相对误差 <8%，真实模型通常 <1%）**、
+  **INT8 Winograd 3×3 快速卷积（整数域 F(2,3)，AVX-512 `vpmaddwd`，较 im2col+INT8 GEMM 提速 5–10×、
+  逼近 float 卷积本体 0.6–1.2×、`max|Δ|/范数<0.6%` 全部 OK）**。
 - ✅ 单线程效率：AVX-512 参考主机实测 **~75–90%** 单核 FMA 峰值（EPYC 9754 Zen4c 真实峰值
   ~83 GFLOPS/核），已进入 MNN 同量级单线程效率区间；当前 AVX2 开发沙箱单线程 GEMM ~32 GFLOPS。
-- 🚧 差距与路线：移动端 **ARM NEON** 后端、**INT8 卷积 Winograd 快路径**（当前 INT8 卷积走 im2col+GEMM，
-  3×3 端到端为 float Winograd 的 0.1–0.2×，是关闭卷积差距、真正比肩 MNN 的关键）、按硬件的
+- 🚧 差距与路线：移动端 **ARM NEON** 后端、按硬件的
   **极致自动调参 (autotuning)**、更细的图优化（算子重排/常量折叠）、多尺寸/非 1 stride 的 Winograd 变体（F(4,3) 等）。
 
-下一步以补齐 INT8 卷积 Winograd、缩小上述差距、在 ARM 端复现对标结果为主。
+下一步以在 ARM 端复现对标结果、补齐自动调参与更大 Winograd 瓦片、进一步逼近 MNN 端到端吞吐为主。
 
 ---
 
@@ -345,6 +387,7 @@ src/conv_int8.cpp        INT8 量化卷积（im2col+INT8 GEMM + 零点偏置校�
 src/winograd.cpp        Winograd F(2,3) 3×3 快速卷积（自动路由，标量兜底 + 运行时派发）
 src/winograd_avx2.cpp   Winograd 累加内层 AVX2+FMA 向量化（-mavx2 -mfma 独立单元）
 src/winograd_avx512.cpp Winograd 累加内层 AVX-512+FMA 向量化（-mavx512f -mfma 独立单元，寄存器驻留累加 + 瓦片并行）
+src/winograd_int8.cpp   INT8 Winograd 3×3 整数域快速卷积（AVX-512 `vpmaddwd` 融合乘加，对标 MNN int8 卷积，-mavx512f -mavx512bw -mfma 独立单元）
 src/layers.cpp          卷积（含融合 ReLU / Winograd 自动路由）、全连接、激活、池化、Softmax、BN
 src/model.cpp           二进制模型加载（含 BN 折叠/ReLU 融合）与顺序执行器
 src/benchmark.cpp       正确性 + GEMM/卷积/端到端/融合 基准（含多线程扩展曲线）

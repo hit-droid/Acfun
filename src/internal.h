@@ -61,6 +61,12 @@ void acfun_gemm_int8_ref_ld(int M, int N, int K,
 void acfun_gemm_int8_avx512(int M, int N, int K,
                             const uint8_t* A, const int8_t* B, int32_t* C);
 
+/* INT8 Winograd F(2,3) 3x3 卷积 (整数域, 对标 MNN int8 路径): 3x3 / stride1 / pad1,
+ * uint8 输入 (零点 zp=128), 逐通道 int8 权重。由 conv_int8.cpp 在 3x3/s1/p1 且通道>=4 时自动路由。 */
+void acfun_winograd_conv3x3_int8(const uint8_t* input, int N, int H, int W, int Cin,
+                                 const int8_t* wq, const float* wscale, const float* bias, int Cout,
+                                 float s_in, float* output, int act);
+
 /* 生效核心数: 取物理核数与 cgroup CPU 配额(cpu.max / cfs_quota)的较小值,
  * 避免多线程在受限容器内争抢导致上下文切换风暴 (例如 16 线程抢 4 核配额)。
  * 无 cgroup 限制时回退物理核数。供 GEMM/卷积并行区设置 num_threads 上限。 */

@@ -142,5 +142,19 @@ M=N=K        float-GFLOPS      int8-GOPS   1T INT8/FP     MT加速
   56x56x16->32 k1 s2  FP:  0.016ms(63938.1/s)  INT8:  0.470ms(2127.5/s)  加速0.0x  max|Δ|=3.008e-02
   224x224x3->16 k3 s1  FP:  2.308ms( 433.3/s)  INT8: 12.542ms(  79.7/s)  加速0.2x  max|Δ|=5.512e+00
   * 前三位 meanRel 来自 test_int8 多配置精度扫描 (随机权重最坏情形); 真实模型(BN/ReLU)通常 <1%
-  * 速度: 当前 INT8 卷积走 im2col+INT8 GEMM, 3x3 为 float Winograd 路径的 0.1-0.2x;
-    补齐 INT8 Winograd 是关闭卷积差距、真正比肩 MNN 的下一里程碑
+  * 速度: 当前 INT8 卷积 3x3 走 im2col+INT8 GEMM, 为 float Winograd 路径的 0.1-0.2x;
+    已补齐 INT8 Winograd (见下节), 该差距已实质性收敛
+
+=== INT8 Winograd 3x3 卷积 (AVX-512, vpmaddwd, 本轮新增 —— 关闭卷积差距) ===
+  量化: 对称逐通道权重 scale + 带零点(zp=128)逐张量激活; 与 float 路径同口径 (逐张量激活量化) 比对。
+  112x112x16->16  FP:  1.982ms( 504.6/s)  INT8:  3.396ms( 294.5/s)  加速0.6x  max|Δ|/范数=  0.55% OK
+  56x56x32->32  FP:  1.606ms( 622.7/s)  INT8:  1.856ms( 538.7/s)  加速0.9x  max|Δ|/范数=  0.55% OK
+  28x28x64->64  FP:  1.903ms( 525.4/s)  INT8:  1.556ms( 642.6/s)  加速1.2x  max|Δ|/范数=  0.57% OK
+  64x64x32->64  FP:  1.495ms( 669.0/s)  INT8:  1.593ms( 627.6/s)  加速0.9x  max|Δ|/范数=  0.51% OK
+  113x97x16->48  FP:  1.251ms( 799.5/s)  INT8:  2.076ms( 481.8/s)  加速0.6x  max|Δ|/范数=  0.57% OK
+  48x48x64->16  FP:  1.297ms( 771.2/s)  INT8:  1.682ms( 594.6/s)  加速0.8x  max|Δ|/范数=  0.57% OK
+  24x24x8->64  FP:  0.406ms(2462.5/s)  INT8:  0.492ms(2030.6/s)  加速0.8x  max|Δ|/范数=  0.52% OK
+  * 关键: INT8 Winograd 与 float Winograd 同构 (F(2,3), 乘法量降 2.25x, 跳过 im2col),
+    主乘累加 M=d_hat⊙g_hat 为 int16×int16→int32, 经 AVX-512 vpmaddwd 融合乘加, 带宽仅 float 之半;
+    较旧 im2col+INT8 GEMM 路径 (3x3 仅 0.1-0.2x float) 提速约 5-10x, 现逼近 float 卷积本体 (0.6-1.2x)。
+  * 精度: max|Δ|/范数 < 0.6% (逐张量激活量化固有误差; 真实模型 BN/ReLU 通常 <1%), 全部 OK。

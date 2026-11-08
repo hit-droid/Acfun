@@ -21,6 +21,7 @@ add_library(acfun STATIC
     src/winograd_avx512.cpp
     src/layers.cpp
     src/conv_int8.cpp
+    src/winograd_int8.cpp
     src/model.cpp
 )
 target_include_directories(acfun PUBLIC
@@ -35,6 +36,10 @@ set_source_files_properties(src/gemm_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx5
 set_source_files_properties(src/gemm_int8_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma -mavx512vnni")
 set_source_files_properties(src/winograd_avx2.cpp PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
 set_source_files_properties(src/winograd_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma")
+# INT8 Winograd: 512-bit 向量化, 与 float Winograd-AVX512 同构 (输出通道 16 路分块 + 寄存器驻留
+# 累加 + d_hat 广播复用)。int16×int16→int32 经 vpmovsxwd+vpmulld 累加, 带宽仅 float 之半。仅在
+# 检测到 avx512f 时由 conv_int8 路由调用, 否则回落 im2col+INT8 GEMM。需 -mavx512bw 支撑 512-bit 整指令。
+set_source_files_properties(src/winograd_int8.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mavx512bw -mfma")
 
 add_executable(acfun_bench src/benchmark.cpp)
 target_link_libraries(acfun_bench PRIVATE acfun)

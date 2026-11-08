@@ -86,6 +86,20 @@ void acfun_conv2d_int8(const float* input, int N_, int H, int W, int Cin,
     /* 2) 构造 GEMM 左矩阵 A[M, K]: 1x1/s1/p0 零拷贝 (A 直接指向 inQ), 否则 im2col(量化) */
     const uint8_t* Aptr = inQ.data();
     std::vector<uint8_t> Aq;
+
+    /* 反量化步长 s_a: 与步骤 1 量化步长严格一致 (x_q = round(x/s_a)+ZP)。 */
+    float sa = maxa / 127.0f;
+
+    /* 3x3 / stride1 / pad1 且通道足够大: 自动路由到 INT8 Winograd 快路径 (对标 MNN int8 卷积),
+     * 乘法量减少 2.25x 且跳过 im2col 展开, 较 im2col+INT8 GEMM 显著提速。本 TU 带 -mavx512f,
+     * 仅在检测到 avx512f 时启用 (512-bit 整指令); 否则回落 im2col+INT8 GEMM (其自身再做
+     * avx512-vnni 派发)。 */
+    if (KH == 3 && KW == 3 && stride == 1 && pad == 1 && H >= 3 && W >= 3
+        && Cin >= 4 && Cout >= 4 && __builtin_cpu_supports("avx512f")) {
+        acfun_winograd_conv3x3_int8(inQ.data(), N_, H, W, Cin, wq, wscale, bias, Cout, sa, output, act);
+        return;
+    }
+
     if (!(KH == 1 && KW == 1 && stride == 1 && pad == 0)) {
         Aq.resize(M * K);
         im2col_u8(inQ.data(), H, W, Cin, KH, KW, stride, pad, OH, OW, Aq.data());
@@ -99,7 +113,6 @@ void acfun_conv2d_int8(const float* input, int N_, int H, int W, int Cin,
     /* 4) 反量化 (+bias 零点校正, 可选 ReLU)。
      *    内积 i32[j] = Σ_k x_q[k]·w_q[k,j]; 真实 ≈ s_a·s_w[j]·(i32[j] − zp·Sw[j]),
      *    Sw[j]=Σ_k w_q[k,j] 为每通道量化权重之和, −zp·Sw[j] 作为零点偏置校正并入 bias。 */
-    float sa = maxa / 127.0f;   /* 与步骤 1 量化步长严格一致 */
     std::vector<float> Sw(Cout, 0.0f);
     for (int j = 0; j < Cout; ++j)
         for (int k = 0; k < K; ++k)

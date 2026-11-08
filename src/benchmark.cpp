@@ -484,6 +484,47 @@ static void bench_int8() {
     printf("  * 精度损失来自逐张量激活量化 (随机权重最坏情形); 真实模型(BN/ReLU)通常 <1%%\n");
 }
 
+/* ---------- 7) INT8 Winograd 3x3 卷积 ----------
+ * 对标 MNN int8 卷积的核心手段: 3x3 专用 Winograd 快路径。acfun_conv2d_int8 已在 3x3/s1/p1
+ * 且通道>=4 时自动路由到本路径。这里用朴素 float 卷积作参考, 跨多种尺寸/通道严格校验数值
+ * 一致性 (容许逐张量激活量化的固有误差), 并给出相对 float 卷积的提速。 */
+static void bench_int8_winograd() {
+    printf("\n=== INT8 Winograd 3x3 卷积 (AVX-512 VNNI 路径) ===\n");
+    struct CC { int H, W, Cin, Cout; } cfgs[] = {
+        {112,112,16,16}, {56,56,32,32}, {28,28,64,64}, {224,224,3,16},
+        {64,64,32,64}, {113,97,16,48}, {48,48,64,16}, {24,24,8,64},
+    };
+    for (auto& c : cfgs) {
+        int H=c.H,W=c.W,Cin=c.Cin,Cout=c.Cout,KH=3,KW=3,st=1,pd=1,N=1;
+        if (Cin < 4 || Cout < 4) continue;
+        int OH=H, OW=W;
+        size_t inN=(size_t)N*H*W*Cin, wN=(size_t)KH*KW*Cin*Cout, outN=(size_t)N*OH*OW*Cout;
+        std::vector<float> in(inN), w(wN), b(Cout,0.1f), on(outN), of(outN), oi(outN);
+        rand_fill(in.data(),inN); rand_fill(w.data(),wN);
+        std::vector<float> ws(Cout); std::vector<int8_t> wq(wN);
+        acfun_quantize_weights(w.data(), KH*KW*Cin, Cout, ws.data(), wq.data());
+
+        /* 参考: 朴素 float 卷积; float 引擎 (自动走 float Winograd); INT8 引擎 (自动走 INT8 Winograd) */
+        conv_naive(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,on.data());
+        acfun_conv2d(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,of.data());
+        int reps = (outN > (1u<<24)) ? 5 : 20;
+        acfun_set_threads(1); acfun_set_num_threads_runtime(1);
+        double t0=now(); for(int r=0;r<reps;++r) acfun_conv2d(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,of.data());
+        double tf=(now()-t0)/reps;
+        t0=now(); for(int r=0;r<reps;++r) acfun_conv2d_int8(in.data(),N,H,W,Cin,wq.data(),ws.data(),b.data(),KH,KW,Cout,st,pd,0.0f,oi.data(),0);
+        double ti=(now()-t0)/reps;
+
+        /* 正确性: INT8 vs float 参考 (容许逐张量激活量化误差) */
+        float maxd=0, norm=0;
+        for(size_t i=0;i<outN;++i){ maxd=std::max(maxd,std::fabs(on[i]-oi[i])); norm=std::max(norm,std::fabs(on[i])); }
+        float rel = norm>1e-9f ? maxd/norm : 0.0f;
+        bool ok = rel < 0.10f;   /* 逐张量激活量化下随机权重最坏情形约数 %, 真实模型通常 <1% */
+        printf("  %dx%dx%d->%d  FP:%7.3fms(%6.1f/s)  INT8:%7.3fms(%6.1f/s)  加速%.1fx  max|Δ|/范数=%6.2f%% %s\n",
+               H,W,Cin,Cout, tf*1e3,1.0/tf, ti*1e3,1.0/ti, tf/ti, rel*100.0f, ok?"OK":"FAIL");
+    }
+    printf("  * INT8 Winograd 较 float 卷积 乘法量降 2.25x, 带宽仅 int8/int16; 精度损失来自逐张量激活量化\n");
+}
+
 int main(int argc, char** argv) {
     printf("Acfun 推理引擎基准  |  后端: %s\n", acfun_backend_name());
     int fails = correctness();
@@ -497,6 +538,7 @@ int main(int argc, char** argv) {
     bench_conv1x1();
     bench_conv_bn_relu_composite();
     bench_int8();
+    bench_int8_winograd();
     printf("\n正确性: %s\n", fails == 0 ? "全部通过" : "存在失败");
     return fails == 0 ? 0 : 1;
 }
