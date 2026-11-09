@@ -208,6 +208,54 @@ static void bench_winograd() {
     printf("  %s\n", fails==0 ? "Winograd 全部通过" : "Winograd 存在失败");
 }
 
+/* ---------- 3c) Winograd F(4,3) 大瓦片: 正确性 + 相对 F(2,3) 提速 ----------
+ * 对标 MNN 用更大 Winograd 瓦片逼近吞吐的核心手段。直接用 acfun_winograd43_conv3x3
+ * (经 dispatcher 自动派发 AVX-512 / 标量) 与 F(2,3) 及朴素直乘严格校验数值一致性,
+ * 并跨大特征图尺寸量化 F(4,3) 相对 F(2,3) 的提速 (瓦片数降 1/4 → 摊薄变换开销与 g_hat 重取)。 */
+static void bench_winograd43() {
+    printf("\n=== Winograd F(4,3) vs F(2,3) 大瓦片: 正确性与加速 ===\n");
+    struct Cfg { int H, W, Cin, Cout; } cfgs[] = {
+        {112,112,16,16}, {64,64,32,32}, {57,55,24,48}, {113,97,16,16},
+        {48,48,64,16}, {224,224,3,16}, {32,32,16,16}, {40,40,24,24},
+    };
+    int fails = 0;
+    for (auto& c : cfgs) {
+        int H=c.H,W=c.W,Cin=c.Cin,Cout=c.Cout,KH=3,KW=3,st=1,pd=1,N=1;
+        int OH=H, OW=W;
+        size_t inN=(size_t)N*H*W*Cin, wN=(size_t)KH*KW*Cin*Cout, outN=(size_t)N*OH*OW*Cout;
+        std::vector<float> in(inN), w(wN), b(Cout,0.1f), on(outN), o2(outN), o4(outN);
+        rand_fill(in.data(),inN); rand_fill(w.data(),wN);
+        conv_naive(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,on.data());
+        acfun_winograd_conv3x3(in.data(),N,H,W,Cin,w.data(),b.data(),Cout,o2.data(),0);
+        acfun_winograd43_conv3x3(in.data(),N,H,W,Cin,w.data(),b.data(),Cout,o4.data(),0);
+        float maxd2=0,maxd4=0;
+        for(size_t i=0;i<outN;++i){ maxd2=std::max(maxd2,std::fabs(on[i]-o2[i])); maxd4=std::max(maxd4,std::fabs(on[i]-o4[i])); }
+        bool ok2 = maxd2 < 1e-2f, ok4 = maxd4 < 1e-2f;
+        if(!ok2||!ok4) fails++;
+        printf("  %dx%dx%d->%d  F2 max|Δ|=%9.3e %s  F4 max|Δ|=%9.3e %s\n",
+               H,W,Cin,Cout, maxd2, ok2?"OK":"FAIL", maxd4, ok4?"OK":"FAIL");
+    }
+    /* 大特征图吞吐对比 (F(2,3) vs F(4,3), 均相对 naive) */
+    {
+        int H=112,W=112,Cin=16,Cout=16,KH=3,KW=3,st=1,pd=1,N=1,OH=H,OW=W;
+        size_t inN=(size_t)N*H*W*Cin, wN=(size_t)KH*KW*Cin*Cout, outN=(size_t)N*OH*OW*Cout;
+        std::vector<float> in(inN), w(wN), b(Cout,0.1f), on(outN), o2(outN), o4(outN);
+        rand_fill(in.data(),inN); rand_fill(w.data(),wN);
+        int reps=30; double tn=0, t2=0, t4=0;
+        std::vector<float> oref(outN);
+        { double t0=now(); for(int i=0;i<reps;++i) conv_naive(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,oref.data()); tn=(now()-t0)/reps; }
+        { double t0=now(); for(int i=0;i<reps;++i) acfun_winograd_conv3x3(in.data(),N,H,W,Cin,w.data(),b.data(),Cout,o2.data(),0); t2=(now()-t0)/reps; }
+        { double t0=now(); for(int i=0;i<reps;++i) acfun_winograd43_conv3x3(in.data(),N,H,W,Cin,w.data(),b.data(),Cout,o4.data(),0); t4=(now()-t0)/reps; }
+        float md4=0; for(size_t i=0;i<outN;++i) md4=std::max(md4,std::fabs(oref[i]-o4[i]));
+        printf("  112²x16x16  naive : %7.3f ms  (%6.1f img/s)\n", tn*1e3, 1.0/tn);
+        printf("  112²x16x16  F(2,3): %7.3f ms  (%6.1f img/s)\n", t2*1e3, 1.0/t2);
+        printf("  112²x16x16  F(4,3): %7.3f ms  (%6.1f img/s)  max|Δ|=%9.3e %s\n",
+               t4*1e3, 1.0/t4, md4, md4<1e-2f?"OK":"FAIL");
+        printf("  F(4,3) / F(2,3) 加速 : %7.1fx\n", t2/t4);
+    }
+    printf("  %s\n", fails==0 ? "Winograd F(4,3) 全部通过" : "Winograd F(4,3) 存在失败");
+}
+
 /* ---------- 4) 端到端 ---------- */
 static void bench_e2e(const char* model_path) {
     printf("\n=== 端到端模型前向 ===\n");
@@ -532,6 +580,7 @@ int main(int argc, char** argv) {
     bench_gemm_scale();
     bench_conv();
     bench_winograd();
+    bench_winograd43();
     const char* mp = (argc > 1) ? argv[1] : "model.acfun";
     bench_e2e(mp);
     bench_fusion(mp);

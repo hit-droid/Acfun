@@ -112,11 +112,20 @@ static void conv2d_impl(const float* input, int N, int H, int W, int Cin,
         conv1x1_impl(input, N, H, W, Cin, weight, bias, Cout, stride, pad, output, act);
         return;
     }
-    /* Winograd F(2,3) 快路径: 仅 3x3 / stride1 / pad1, 且通道与特征图足够大
-     * (变换开销固定, 小通道/小图下收益不明显, 回落 im2col+GEMM 更稳)。 */
+    /* Winograd 快路径: 仅 3x3 / stride1 / pad1, 且通道与特征图足够大
+     * (变换开销固定, 小通道/小图下收益不明显, 回落 im2col+GEMM 更稳)。
+     * 瓦片选择 (实测 4 核 Zen5 上 F(4,3) 仅在大图+大通道时胜出):
+     *   - F(4,3): 6x6 输入 / 4x4 输出 / 瓦片数降为 F(2,3) 的 1/4, 乘法量/输出降 1.78x,
+     *     仅在特征图>=112² 且 Cin,Cout>=64 (计算受限, 算术削减才生效) 时启用; 小图/小通道
+     *     下因 NHWC 跨行 gather 与边界瓦片填充浪费反而更慢。
+     *   - 其余大图与小图一律 F(2,3) (瓦片更小、边界浪费更低, 且输出变换已 512-bit 向量化)。
+     * 这正是 MNN 按张量尺寸在 F(2,3)/F(4,3) 间派发的思路。 */
     if (KH == 3 && KW == 3 && stride == 1 && pad == 1 && H >= 3 && W >= 3
         && Cin >= 4 && Cout >= 4) {
-        acfun_winograd_conv3x3(input, N, H, W, Cin, weight, bias, Cout, output, act);
+        if (H >= 112 && W >= 112 && Cin >= 64 && Cout >= 64)
+            acfun_winograd43_conv3x3(input, N, H, W, Cin, weight, bias, Cout, output, act);
+        else
+            acfun_winograd_conv3x3(input, N, H, W, Cin, weight, bias, Cout, output, act);
         return;
     }
 

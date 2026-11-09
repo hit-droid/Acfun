@@ -33,6 +33,17 @@ void acfun_winograd_conv3x3(const float* input, int N, int H, int W, int Cin,
 void acfun_winograd_conv3x3_scalar(const float* input, int N, int H, int W, int Cin,
                                    const float* weight, const float* bias,
                                    int Cout, float* output, int act);
+/* Winograd F(4,3) 卷积 (更大瓦片: 6x6 输入 / 4x4 输出 / 36 变换域元素), 对标 MNN 大瓦片路线:
+ * 3x3 / stride1 / pad1, 仅依赖权重与输入块尺寸, 与 F(2,3) 同布局、同算法, 瓦片数降为 1/4。 */
+void acfun_winograd43_conv3x3(const float* input, int N, int H, int W, int Cin,
+                              const float* weight, const float* bias,
+                              int Cout, float* output, int act);
+void acfun_winograd43_conv3x3_scalar(const float* input, int N, int H, int W, int Cin,
+                                     const float* weight, const float* bias,
+                                     int Cout, float* output, int act);
+void acfun_winograd43_conv3x3_avx512(const float* input, int N, int H, int W, int Cin,
+                                     const float* weight, const float* bias,
+                                     int Cout, float* output, int act);
 /* AVX2+FMA 变体 (编译单元带 -mavx2 -mfma): 量化/累加内层 256-bit 向量化 */
 void acfun_winograd_conv3x3_avx2(const float* input, int N, int H, int W, int Cin,
                                  const float* weight, const float* bias,

@@ -64,23 +64,13 @@ inline void filter_transform(const float* g, float* gh) {
     }
 }
 
-/* 输出变换 Y = AT M ATᵀ (M = m_hat[c] 为 4x4, 以 ij*Cout+c 跨 c 步长存储)。 */
-inline void output_transform(const float* mh, int Cout, int c, float Y[4]) {
-    static const float AT[2][4] = {{1.f, 1.f, 1.f, 0.f}, {0.f, 1.f, -1.f, 1.f}};
-    for (int r = 0; r < 2; ++r) {
-        for (int cc = 0; cc < 2; ++cc) {
-            float s = 0.f;
-            for (int i = 0; i < 4; ++i) {
-                float ri = AT[r][i];
-                if (ri == 0.f) continue;
-                for (int j = 0; j < 4; ++j) {
-                    float cj = AT[cc][j];
-                    if (cj == 0.f) continue;
-                    s += ri * cj * mh[((size_t)i * 4 + j) * Cout + c];
-                }
-            }
-            Y[r * 2 + cc] = s;
-        }
+/* 输出变换系数表 coef[p][k] = AT[r][i]*AT[cc][j], p=r*2+cc, k=i*4+j (F(2,3) 2x2 输出
+ * / 4x4 变换域)。供向量化 scatter-add 输出变换复用。 */
+static const float AT_F23[2][4] = {{1.f, 1.f, 1.f, 0.f}, {0.f, 1.f, -1.f, 1.f}};
+inline void output_transform_coeff(float coef[4][16]) {
+    for (int p = 0; p < 4; ++p) {
+        int r = p / 2, cc = p % 2;
+        for (int k = 0; k < 16; ++k) coef[p][k] = AT_F23[r][k / 4] * AT_F23[cc][k % 4];
     }
 }
 
@@ -145,21 +135,49 @@ static void wino_tile_avx512(int ty, int tx, int OH, int OW, int Cin, int Cout, 
             _mm512_mask_storeu_ps(&m_hat[(size_t)ij * Cout + c], msk, acc[ij]);
     }
 
-    /* 输出变换 Y = AT M ATᵀ, 写回 2x2 输出并融合 bias/ReLU (无分支 vmax) */
+    /* 向量化输出变换 Y=AT·M·ATᵀ: 4 个输出空间位置各持一条 c 块累加器, 对 16 个变换域 k
+     * 做 scatter-add (vk=m_hat[k][c:c+16], oacc[p]+=coef[p][k]·vk), 消除逐通道标量
+     * 4×16 输出的 ILP 受限与零系数分支, 较原标量输出变换大幅提速。 */
+    float coef[4][16];
+    output_transform_coeff(coef);
     float* yo = output + (size_t)n * OH * OW * Cout;
-    for (int c = 0; c < Cout; ++c) {
-        float Y[4];
-        output_transform(m_hat, Cout, c, Y);
-        float b = bias ? bias[c] : 0.0f;
-        for (int r = 0; r < 2; ++r) {
-            int oh = oh0 + r;
-            if (oh >= OH) continue;
-            for (int cc = 0; cc < 2; ++cc) {
-                int ow = ow0 + cc;
-                if (ow >= OW) continue;
-                float v = Y[r * 2 + cc] + b;
-                if (act == 1) v = v < 0.0f ? 0.0f : v;
-                yo[(size_t)(oh * OW + ow) * Cout + c] = v;
+
+    int cb = 0;
+    for (; cb + 16 <= Cout; cb += 16) {
+        __m512 oacc[4];
+        for (int p = 0; p < 4; ++p) oacc[p] = _mm512_setzero_ps();
+        for (int k = 0; k < 16; ++k) {
+            __m512 vk = _mm512_loadu_ps(&m_hat[(size_t)k * Cout + cb]);
+            for (int p = 0; p < 4; ++p)
+                oacc[p] = _mm512_fmadd_ps(_mm512_set1_ps(coef[p][k]), vk, oacc[p]);
+        }
+        for (int p = 0; p < 4; ++p) {
+            int r = p / 2, cc = p % 2, oh = oh0 + r, ow = ow0 + cc;
+            if (oh < OH && ow < OW) {
+                __m512 v = oacc[p];
+                if (bias) v = _mm512_add_ps(v, _mm512_loadu_ps(&bias[cb]));
+                if (act == 1) v = _mm512_max_ps(v, _mm512_setzero_ps());
+                _mm512_storeu_ps(&yo[(size_t)(oh * OW + ow) * Cout + cb], v);
+            }
+        }
+    }
+    if (cb < Cout) {
+        int rem = Cout - cb;
+        __mmask16 msk = (__mmask16)((1u << rem) - 1);
+        __m512 oacc[4];
+        for (int p = 0; p < 4; ++p) oacc[p] = _mm512_setzero_ps();
+        for (int k = 0; k < 16; ++k) {
+            __m512 vk = _mm512_maskz_loadu_ps(msk, &m_hat[(size_t)k * Cout + cb]);
+            for (int p = 0; p < 4; ++p)
+                oacc[p] = _mm512_fmadd_ps(_mm512_set1_ps(coef[p][k]), vk, oacc[p]);
+        }
+        for (int p = 0; p < 4; ++p) {
+            int r = p / 2, cc = p % 2, oh = oh0 + r, ow = ow0 + cc;
+            if (oh < OH && ow < OW) {
+                __m512 v = oacc[p];
+                if (bias) v = _mm512_add_ps(v, _mm512_maskz_loadu_ps(msk, &bias[cb]));
+                if (act == 1) v = _mm512_max_ps(v, _mm512_setzero_ps());
+                _mm512_mask_storeu_ps(&yo[(size_t)(oh * OW + ow) * Cout + cb], msk, v);
             }
         }
     }
