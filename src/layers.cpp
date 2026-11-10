@@ -3,6 +3,8 @@
 #include "internal.h"
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <vector>
 #include <algorithm>
 
 void acfun_relu(float* d, size_t len) {
@@ -102,11 +104,50 @@ static void conv1x1_impl(const float* input, int N, int H, int W, int Cin,
     free(gemm_out);
 }
 
-/* 卷积内部实现: act=0 无激活, act=1 融合 ReLU (在输出写入时就地施加, 省去额外扫描) */
+/* 卷积内部实现: act=0 无激活, act=1 融合 ReLU (在输出写入时就地施加, 省去额外扫描)。
+ * groups>1 时进入分组卷积: 深度卷积 (groups==Cin==Cout) 路由到专属深度路径, 否则各组独立
+ * 复用引擎既有 1x1 / Winograd / im2col 子路径。 */
 static void conv2d_impl(const float* input, int N, int H, int W, int Cin,
                         const float* weight, const float* bias,
                         int KH, int KW, int Cout, int stride, int pad,
-                        float* output, int act) {
+                        int groups, float* output, int act) {
+    /* ---- 分组卷积 ---- */
+    if (groups > 1) {
+        if (groups == Cin && groups == Cout) {
+            /* 深度可分离卷积: 权重内存布局与 [C,KH,KW] 完全一致 (Cout_per=1 -> 每通道 9 权重) */
+            acfun_conv2d_dw(input, N, H, W, Cin, weight, bias, KH, KW, stride, pad, output, act);
+            return;
+        }
+        int Cin_per  = Cin / groups;
+        int Cout_per = Cout / groups;
+        int OH = (H + 2 * pad - KH) / stride + 1;
+        int OW = (W + 2 * pad - KW) / stride + 1;
+        if (OH <= 0 || OW <= 0) return;
+        /* NHWC 下各组的输入/输出通道在每像素内连续, 但像素间步长 = 总通道数,
+         * 无法用单一指针偏移表达, 故每组先抽取连续缓冲再调用引擎子路径,
+         * 权重块本就按 [(kh,kw,ic)][oc] 连续存放无需重排。 */
+        std::vector<float> in_g((size_t)N * H * W * Cin_per);
+        std::vector<float> out_g((size_t)N * OH * OW * Cout_per);
+        for (int g = 0; g < groups; ++g) {
+            for (size_t p = 0; p < (size_t)N * H * W; ++p) {
+                std::memcpy(in_g.data() + p * Cin_per,
+                            input + p * Cin + (size_t)g * Cin_per,
+                            (size_t)Cin_per * sizeof(float));
+            }
+            conv2d_impl(in_g.data(), N, H, W, Cin_per,
+                        weight + (size_t)g * Cout_per * KH * KW * Cin_per,
+                        bias ? bias + g * Cout_per : nullptr,
+                        KH, KW, Cout_per, stride, pad, 1,
+                        out_g.data(), act);
+            for (size_t p = 0; p < (size_t)N * OH * OW; ++p) {
+                std::memcpy(output + p * Cout + (size_t)g * Cout_per,
+                            out_g.data() + p * Cout_per,
+                            (size_t)Cout_per * sizeof(float));
+            }
+        }
+        return;
+    }
+
     /* 1x1 逐点卷积: 直接 GEMM, 跳过 im2col (见 conv1x1_impl) */
     if (KH == 1 && KW == 1) {
         conv1x1_impl(input, N, H, W, Cin, weight, bias, Cout, stride, pad, output, act);
@@ -161,14 +202,22 @@ void acfun_conv2d(const float* input, int N, int H, int W, int Cin,
                   const float* weight, const float* bias,
                   int KH, int KW, int Cout, int stride, int pad,
                   float* output) {
-    conv2d_impl(input, N, H, W, Cin, weight, bias, KH, KW, Cout, stride, pad, output, 0);
+    conv2d_impl(input, N, H, W, Cin, weight, bias, KH, KW, Cout, stride, pad, 1, output, 0);
 }
 
 void acfun_conv2d_relu(const float* input, int N, int H, int W, int Cin,
                        const float* weight, const float* bias,
                        int KH, int KW, int Cout, int stride, int pad,
                        float* output) {
-    conv2d_impl(input, N, H, W, Cin, weight, bias, KH, KW, Cout, stride, pad, output, 1);
+    conv2d_impl(input, N, H, W, Cin, weight, bias, KH, KW, Cout, stride, pad, 1, output, 1);
+}
+
+void acfun_conv2d_g(const float* input, int N, int H, int W, int Cin,
+                    const float* weight, const float* bias,
+                    int KH, int KW, int Cout, int stride, int pad, int groups,
+                    float* output, int act) {
+    conv2d_impl(input, N, H, W, Cin, weight, bias, KH, KW, Cout, stride, pad,
+                groups > 1 ? groups : 1, output, act);
 }
 
 void acfun_maxpool(const float* in, int N, int H, int W, int C,

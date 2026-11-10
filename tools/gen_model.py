@@ -19,6 +19,17 @@ def conv(prevC, Cout, KH=3, KW=3, stride=1, pad=1, name=""):
     body = u32(1) + u32(KH)+u32(KW)+u32(Cout)+u32(stride)+u32(pad) + fblob(w) + fblob(b)
     return body, Cout
 
+def conv_g(prevC, Cout, groups, KH=3, KW=3, stride=1, pad=1):
+    """分组卷积 (type 7): 权重布局 [groups, Cout_per, KH*KW*Cin_per], Cout_per=Cout/groups。
+    groups==prevC==Cout 时即深度(逐通道)卷积, 引擎自动路由到 acfun_conv2d_dw。"""
+    Cin_per = prevC // groups
+    Cout_per = Cout // groups
+    w = [random.uniform(-0.1, 0.1) for _ in range(groups * Cout_per * KH * KW * Cin_per)]
+    b = [0.0]*Cout
+    body = (u32(7) + u32(KH)+u32(KW)+u32(Cout)+u32(stride)+u32(pad)+u32(groups)
+            + fblob(w) + fblob(b))
+    return body, Cout
+
 def fc(inDim, Cout):
     w = [random.uniform(-0.1, 0.1) for _ in range(inDim*Cout)]
     b = [0.0]*Cout
@@ -39,6 +50,11 @@ def main():
     body, C = conv(inC, 16, KH=3, KW=3, stride=1, pad=1); layers += body
     layers += bn(16)
     layers += relu()
+    # 深度卷积 (分组, groups==Cin==Cout): 3x3, stride1, pad1  ->  BN  ->  ReLU
+    # 引擎自动路由到 acfun_conv2d_dw (跨通道 16 路 AVX-512 向量化); 验证 BN 折叠 + ReLU 融合。
+    body, C = conv_g(C, 16, groups=16, KH=3, KW=3, stride=1, pad=1); layers += body
+    layers += bn(16)
+    layers += relu()
     # Conv2: 3x3, stride2, pad1  ->  BN  ->  ReLU
     body, C = conv(C, 32, KH=3, KW=3, stride=2, pad=1); layers += body
     layers += bn(32)
@@ -54,7 +70,7 @@ def main():
 
     blob = (MAGIC + u32(1)                       # version
             + u32(inC)+u32(inH)+u32(inW)
-            + u32(10)                            # num_layers: conv,bn,relu,conv,bn,relu,maxpool,fc,relu,softmax
+            + u32(13)                            # num_layers: conv,bn,relu,dwconv,bn,relu,conv,bn,relu,maxpool,fc,relu,softmax
             + layers)
     with open(out, "wb") as f:
         f.write(blob)

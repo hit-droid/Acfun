@@ -307,6 +307,12 @@ static std::vector<RLayer> ref_parse(const char* path, int* inC, int* inH, int* 
                       int pd=r_u32(blob.data()+o);o+=4; x.p[0]=KH;x.p[1]=KW;x.p[2]=Co;x.p[3]=st;x.p[4]=pd;
                       size_t wn=(size_t)KH*KW*prevC*Co; x.w=(const float*)(blob.data()+o); o+=wn*4;
                       x.b=(const float*)(blob.data()+o); o+=(size_t)Co*4; prevC=Co; break; }
+            case 7: { int KH=r_u32(blob.data()+o);o+=4; int KW=r_u32(blob.data()+o);o+=4;
+                      int Co=r_u32(blob.data()+o);o+=4; int st=r_u32(blob.data()+o);o+=4;
+                      int pd=r_u32(blob.data()+o);o+=4; int Gg=r_u32(blob.data()+o);o+=4;
+                      x.p[0]=KH;x.p[1]=KW;x.p[2]=Co;x.p[3]=st;x.p[4]=pd;x.p[5]=Gg;
+                      size_t wn=(size_t)KH*KW*prevC*Co/Gg; x.w=(const float*)(blob.data()+o); o+=wn*4;
+                      x.b=(const float*)(blob.data()+o); o+=(size_t)Co*4; prevC=Co; break; }
             case 2: { int Co=r_u32(blob.data()+o);o+=4; int id=r_u32(blob.data()+o);o+=4;
                       x.p[0]=Co;x.p[1]=id; size_t wn=(size_t)id*Co; x.w=(const float*)(blob.data()+o);o+=wn*4;
                       x.b=(const float*)(blob.data()+o);o+=(size_t)Co*4; prevC=Co; break; }
@@ -333,6 +339,10 @@ static void ref_exec(const std::vector<RLayer>& L, int inC, int inH, int inW,
                       nH=(H+2*pd-KH)/st+1; nW=(W+2*pd-KW)/st+1; nC=Co; ncap=(size_t)N*nH*nW*nC;
                       nxt=(float*)malloc(ncap*sizeof(float));
                       acfun_conv2d(cur,N,H,W,C,x.w,x.b,KH,KW,Co,st,pd,nxt); break; }
+            case 7: { int KH=x.p[0],KW=x.p[1],Co=x.p[2],st=x.p[3],pd=x.p[4],Gg=x.p[5];
+                      nH=(H+2*pd-KH)/st+1; nW=(W+2*pd-KW)/st+1; nC=Co; ncap=(size_t)N*nH*nW*nC;
+                      nxt=(float*)malloc(ncap*sizeof(float));
+                      acfun_conv2d_g(cur,N,H,W,C,x.w,x.b,KH,KW,Co,st,pd,Gg,nxt,0); break; }
             case 2: { int Co=x.p[0]; int id=H*W*C; nH=1;nW=1;nC=Co; ncap=(size_t)N*nC;
                       nxt=(float*)malloc(ncap*sizeof(float)); acfun_fc(cur,N,id,x.w,x.b,Co,nxt); break; }
             case 3: { ncap=cap; nxt=(float*)malloc(ncap*sizeof(float)); memcpy(nxt,cur,ncap*sizeof(float)); acfun_relu(nxt,ncap); break; }
@@ -460,6 +470,118 @@ static void bench_conv1x1() {
     printf("  %s\n", fails==0 ? "1x1 卷积全部通过" : "1x1 卷积存在失败");
 }
 
+/* ---------- 3d) 深度(逐通道)卷积: 正确性 + 提速 ----------
+ * 深度卷积 (groups==Cin==Cout) 是 MobileNet/EfficientNet 的核心算子。acfun_conv2d_dw 跨通道 16 路
+ * AVX-512 向量化 + 权重预转置常驻 L1; 与之对照的朴素逐通道标量实现作参考。同时给出相对
+ * "把深度卷积当普通卷积走 im2col+GEMM (K=KH*KW 极小, 算术强度崩溃)" 的理论开销说明。 */
+static void dw_naive(const float* in, int N, int H, int W, int C,
+                     const float* w, const float* b, int KH, int KW, int st, int pd,
+                     float* out, int act) {
+    int OH = (H + 2*pd - KH)/st + 1, OW = (W + 2*pd - KW)/st + 1;
+    for (int n = 0; n < N; ++n)
+        for (int oc = 0; oc < C; ++oc) {
+            const float* wch = w + (size_t)oc * KH * KW;
+            for (int oh = 0; oh < OH; ++oh)
+                for (int ow = 0; ow < OW; ++ow) {
+                    float s = b ? b[oc] : 0.0f;
+                    for (int kh = 0; kh < KH; ++kh) {
+                        int ih = oh*st - pd + kh; if (ih < 0 || ih >= H) continue;
+                        for (int kw = 0; kw < KW; ++kw) {
+                            int iw = ow*st - pd + kw; if (iw < 0 || iw >= W) continue;
+                            s += in[(((size_t)n*H + ih)*W + iw)*C + oc] * wch[kh*KW + kw];
+                        }
+                    }
+                    if (act == 1 && s < 0.0f) s = 0.0f;
+                    out[(((size_t)n*OH + oh)*OW + ow)*C + oc] = s;
+                }
+        }
+}
+
+static void bench_depthwise() {
+    printf("\n=== 深度(逐通道)卷积: 正确性与加速 (AVX-512 向量化 DW) ===\n");
+    struct Cfg { int H, W, C, KH, KW, st, pd; } cfgs[] = {
+        {112,112,16,3,3,1,1}, {56,56,32,3,3,1,1}, {224,224,3,3,3,1,1},
+        {56,56,128,3,3,2,1}, {28,28,24,3,3,1,1}, {64,64,512,3,3,1,1},
+        {64,64,64,1,1,1,0}, {16,16,8,3,3,1,1},
+    };
+    int fails = 0;
+    for (auto& c : cfgs) {
+        int H=c.H,W=c.W,C=c.C,KH=c.KH,KW=c.KW,st=c.st,pd=c.pd,N=1,act=1;
+        int OH=(H+2*pd-KH)/st+1, OW=(W+2*pd-KW)/st+1;
+        size_t inN=(size_t)N*H*W*C, wN=(size_t)C*KH*KW, outN=(size_t)N*OH*OW*C;
+        std::vector<float> in(inN), w(wN), b(C,0.1f), on(outN), oa(outN);
+        rand_fill(in.data(),inN); rand_fill(w.data(),wN);
+        int reps = (outN > (1u<<24)) ? 5 : 30;
+        double tn=0, ta=0; std::vector<float> ore(outN);
+        { double t0=now(); for(int i=0;i<reps;++i) dw_naive(in.data(),N,H,W,C,w.data(),b.data(),KH,KW,st,pd,ore.data(),act); tn=(now()-t0)/reps; }
+        { double t0=now(); for(int i=0;i<reps;++i) acfun_conv2d_dw(in.data(),N,H,W,C,w.data(),b.data(),KH,KW,st,pd,oa.data(),act); ta=(now()-t0)/reps; }
+        float maxd=0; for(size_t i=0;i<outN;++i) maxd=std::max(maxd,std::fabs(ore[i]-oa[i]));
+        bool ok = maxd < 1e-2f; if(!ok) fails++;
+        printf("  %dx%dx%d k%d s%d  naive:%7.3fms(%6.1f/s)  DW:%7.3fms(%6.1f/s)  加速%5.1fx  max|Δ|=%9.3e %s\n",
+               H,W,C,KH,st, tn*1e3,1.0/tn, ta*1e3,1.0/ta, tn/ta, maxd, ok?"OK":"FAIL");
+    }
+    printf("  %s\n", fails==0 ? "深度卷积全部通过" : "深度卷积存在失败");
+}
+
+/* ---------- 3e) 分组卷积: 正确性 + 提速 ----------
+ * 一般分组卷积 (groups>1, 非深度) 各组的输入/输出通道连续, 引擎逐组复用 1x1/Winograd/im2col
+ * 子路径; groups==Cin==Cout 自动路由到深度卷积。对照朴素分组参考。 */
+static void conv_g_naive(const float* in, int N, int H, int W, int Cin,
+                         const float* w, const float* b, int KH, int KW, int Cout,
+                         int st, int pd, int G, float* out, int act) {
+    int Cin_p = Cin/G, Cout_p = Cout/G;
+    int OH = (H + 2*pd - KH)/st + 1, OW = (W + 2*pd - KW)/st + 1;
+    for (int g = 0; g < G; ++g)
+        for (int n = 0; n < N; ++n)
+            for (int oc = 0; oc < Cout_p; ++oc) {
+                const float* wg = w + (size_t)g * Cout_p * KH * KW * Cin_p;
+                const float* bg = b ? b + g*Cout_p : nullptr;
+                for (int oh = 0; oh < OH; ++oh)
+                    for (int ow = 0; ow < OW; ++ow) {
+                        float s = bg ? bg[oc] : 0.0f;
+                        for (int kh = 0; kh < KH; ++kh) {
+                            int ih = oh*st - pd + kh; if (ih < 0 || ih >= H) continue;
+                            for (int kw = 0; kw < KW; ++kw) {
+                                int iw = ow*st - pd + kw; if (iw < 0 || iw >= W) continue;
+                                for (int ic = 0; ic < Cin_p; ++ic) {
+                                    size_t idx = ((size_t)n*H + ih)*W + iw;
+                                    size_t ia = (size_t)g*Cin_p + idx*Cin + ic;
+                                    s += in[ia] * wg[((kh*KW+kw)*Cin_p+ic)*Cout_p+oc];
+                                }
+                            }
+                        }
+                        if (act == 1 && s < 0.0f) s = 0.0f;
+                        size_t odx = ((size_t)n*OH + oh)*OW + ow;
+                        out[odx*(size_t)Cout + (size_t)g*Cout_p + oc] = s;
+                    }
+            }
+}
+
+static void bench_grouped() {
+    printf("\n=== 分组卷积: 正确性与加速 ===\n");
+    struct Cfg { int H, W, Cin, Cout, KH, KW, st, pd, G; } cfgs[] = {
+        {56,56,16,32,3,3,1,1,4}, {28,28,32,64,1,1,1,0,8}, {14,14,24,48,3,3,2,1,6},
+        {56,56,32,32,3,3,1,1,32},
+    };
+    int fails = 0;
+    for (auto& c : cfgs) {
+        int H=c.H,W=c.W,Cin=c.Cin,Cout=c.Cout,KH=c.KH,KW=c.KW,st=c.st,pd=c.pd,G=c.G,N=1,act=1;
+        int OH=(H+2*pd-KH)/st+1, OW=(W+2*pd-KW)/st+1;
+        size_t inN=(size_t)N*H*W*Cin, wN=(size_t)G*(Cout/G)*KH*KW*(Cin/G), outN=(size_t)N*OH*OW*Cout;
+        std::vector<float> in(inN), w(wN), b(Cout,0.1f), on(outN), oa(outN);
+        rand_fill(in.data(),inN); rand_fill(w.data(),wN);
+        int reps = (outN > (1u<<24)) ? 5 : 20;
+        double tn=0, ta=0; std::vector<float> ore(outN);
+        { double t0=now(); for(int i=0;i<reps;++i) conv_g_naive(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,G,ore.data(),act); tn=(now()-t0)/reps; }
+        { double t0=now(); for(int i=0;i<reps;++i) acfun_conv2d_g(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,G,oa.data(),act); ta=(now()-t0)/reps; }
+        float maxd=0; for(size_t i=0;i<outN;++i) maxd=std::max(maxd,std::fabs(ore[i]-oa[i]));
+        bool ok = maxd < 1e-2f; if(!ok) fails++;
+        printf("  %dx%dx%d->%d k%d g%d  naive:%7.3fms(%6.1f/s)  G:%7.3fms(%6.1f/s)  加速%5.1fx  max|Δ|=%9.3e %s\n",
+               H,W,Cin,Cout,KH,G, tn*1e3,1.0/tn, ta*1e3,1.0/ta, tn/ta, maxd, ok?"OK":"FAIL");
+    }
+    printf("  %s\n", fails==0 ? "分组卷积全部通过" : "分组卷积存在失败");
+}
+
 /* ---------- 6) INT8 GEMM / 卷积 (AVX-512 VNNI) ----------
  * 对标 MNN int8 推理路径: uint8×int8→int32 的 vpdpbusd 累加器。
  * 报告 INT8 GEMM 的 GOPS (2·M·N·K/t, 与 float GFLOPS 同口径便于比对算力吞吐),
@@ -585,6 +707,8 @@ int main(int argc, char** argv) {
     bench_e2e(mp);
     bench_fusion(mp);
     bench_conv1x1();
+    bench_depthwise();
+    bench_grouped();
     bench_conv_bn_relu_composite();
     bench_int8();
     bench_int8_winograd();

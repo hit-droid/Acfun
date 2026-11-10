@@ -45,6 +45,25 @@ void acfun_conv2d_relu(const float* input, int N, int H, int W, int Cin,
                        int KH, int KW, int Cout, int stride, int pad,
                        float* output);
 
+/* 逐通道(深度可分离)卷积: groups=Cin=Cout, 每个输出通道仅与其同名输入通道做 KH×KW 点积。
+ * 权重布局 [C, KH, KW] (row-major, w[c*KH*KW + kh*KW + kw])。act=1 融合 ReLU。
+ * 这是 MobileNet / EfficientNet 等轻量网络的核心算子, MNN 有专属深度卷积路径;
+ * 相较把深度卷积当普通卷积走 im2col+GEMM (K=KH*KW 极小, 算术强度崩溃), 本路径
+ * 跨通道 16 路 AVX-512 向量化, 带宽利用率大幅提升。 */
+void acfun_conv2d_dw(const float* input, int N, int H, int W, int C,
+                     const float* weight, const float* bias,
+                     int KH, int KW, int stride, int pad,
+                     float* output, int act);
+
+/* 分组卷积: groups 组, 每组输入/输出通道 Cin/groups、Cout/groups。
+ * 权重布局 [groups, Cout_per, KH*KW*Cin_per] (row-major, 组间连续)。
+ * 当 groups==Cin==Cout 时自动路由到深度卷积 (acfun_conv2d_dw); 否则各组独立复用
+ * 引擎既有 1x1 / Winograd / im2col 子路径, 与 MNN 的分组卷积实现一致。 */
+void acfun_conv2d_g(const float* input, int N, int H, int W, int Cin,
+                    const float* weight, const float* bias,
+                    int KH, int KW, int Cout, int stride, int pad, int groups,
+                    float* output, int act);
+
 /* 全连接: out[N, Cout] = in[N, Cin] * W[Cin, Cout] + bias */
 void acfun_fc(const float* input, int N, int Cin,
               const float* weight, const float* bias, int Cout, float* output);

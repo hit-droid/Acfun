@@ -74,6 +74,29 @@ NHWC 下跨 6 行 gather、且边界瓦片填充浪费更高，**仅在 `H≥112
   算术强度不变、GEMM 内核直接复用（见 `bench_conv1x1`）。与 Winograd 互补覆盖了
   卷积的两类最高频形态（3×3 与 1×1）。
 
+### 2.2 深度卷积与分组卷积（轻量网络核心算子）
+
+深度可分离卷积（MobileNet / EfficientNet 等）把"逐通道空间卷积 + 1×1 逐点卷积"拆分，
+**深度卷积（depthwise，groups=Cin=Cout）**使每个输出通道仅与其同名输入通道做 `KH×KW` 点积。
+若把它当普通卷积走 `im2col+GEMM`，展开后 `K=KH·KW` 极小（3×3 → 9），GEMM 算术强度崩溃、
+打包开销完全盖过计算量——这正是 MNN 为深度卷积单独实现专属路径的原因。Acfun 同样补齐：
+
+- **`acfun_conv2d_dw`**：权重布局 `[C, KH, KW]`（row-major），逐通道独立卷积。
+  - **AVX-512 跨通道 16 路向量化**（`src/dw_avx512.cpp`，`-mavx512f -mfma`）：把权重预转置为
+    `wT[K·16]` 缓存于 L1，每个输出像素对 `KH·KW` 个空间偏移各做 16 路 `_mm512_fmadd_ps`；
+    用 AVX-512 掩码 load/store 处理尾通道，padding 区域以掩码加载为零，彻底避免边界分支。
+  - 标量参考实现 `src/dw.cpp`（驱动派发，按 `__builtin_cpu_supports("avx512f")` 选后端）。
+- **`acfun_conv2d_g`**：通用**分组卷积**（groups 组，每组建 `Cin/groups`、`Cout/groups` 通道，
+  权重布局 `[groups, Cout_per, KH·KW·Cin_per]`，组间连续）。
+  - **自动路由**：`groups==Cin==Cout` 时直接落入深度卷积路径（零额外开销）；否则
+    按组把输入/输出抽取到连续临时缓冲，对每组复用引擎既有 1×1 / Winograd / im2col 子路径——
+    与 MNN 的分组卷积实现思路一致（NHWC 下各组通道交错，故需先聚合成连续块再调用）。
+  - **BN 折叠组感知**：`fold_bn_into` 按组索引（`gc=c/Cout_per`、`oc=c%Cout_per`、权重全局偏移
+    `gc·Cout_per·per_in + t·Cout_per + oc`，并除以 `groups` 修正权重计数），Conv/BN/ReLU 融合对
+    分组层同样生效。
+- 模型格式 `ACFUN0` 新增 **type 7（ConvGrouped）**，携带 `groups` 字段；`acfun_model_infer`
+  在 `groups>1` 时改调 `acfun_conv2d_g`，从而深度可分离 / 分组网络可正确表达与融合。
+
 ### 3. 算子融合（图优化）
 加载期对计算图做融合，对标 MNN 的图优化：
 - **BN 折叠**：紧跟 Conv/FC 的 BatchNorm 折叠进该层的权重与偏置，推理时**整层 BN 消失**（省一次全张量读写）。
@@ -380,6 +403,47 @@ stride>1/pad>0 仅做一次跨步 gather 构造 `A`。较朴素直乘（同尺�
 > 本体（0.6–1.2×，大通道已反超）。极小通道（Cin≤16）下仍是整数乘加较 float 单 FMA 的固有指令数劣势，
 > 非正确性或架构缺陷。
 
+### 本轮新增：深度卷积（DW）与分组卷积（Grouped）
+
+补齐 MNN 表达 MobileNet / EfficientNet 等轻量网络缺失的最后一块拼图——深度可分离 / 分组卷积。
+此前分组卷积被当普通卷积走 `im2col+GEMM`（`K=KH·KW` 极小、算术强度崩溃），且 `groups==Cin==Cout`
+的纯深度卷积根本无法正确表达。新增 `src/dw.cpp`（标量参考 + AVX-512 派发）与
+`src/dw_avx512.cpp`（`-mavx512f -mfma` 跨通道 16 路向量化内核），并由 `conv2d_impl` 在 `groups>1`
+时路由到 `acfun_conv2d_g`（深度卷积 `groups==Cin==Cout` 自动落入 DW 路径；其余各组复用既有
+1×1 / Winograd / im2col 子路径）。模型格式新增 **type 7（ConvGrouped）**，`acfun_model_infer` 在
+`groups>1` 时改调分组卷积，BN 折叠亦改为组感知索引。
+
+**实测（沙箱 AVX-512，深度卷积 acfun_conv2d_dw vs 标量参考，全部 `max|Δ|<1e-6`）**：
+
+| 配置 | 标量参考 | DW (AVX-512) | 加速 |
+|------|----------|--------------|------|
+| 112² × 16 k3 s1 | 6.12 ms (163/s) | 0.205 ms (4888/s) | **29.9×** |
+| 56² × 32 k3 s1 | 3.05 ms (328/s) | 0.090 ms (11073/s) | **33.8×** |
+| 224² × 3 k3 s1 | 4.54 ms (220/s) | 0.772 ms (1296/s) | **5.9×** |
+| 56² × 128 k3 s2 | 4.28 ms (234/s) | 0.164 ms (6092/s) | **26.1×** |
+| 28² × 24 k3 s1 | 0.56 ms (1783/s) | 0.022 ms (45423/s) | **25.5×** |
+| 64² × 512 k3 s1 | 105.8 ms (9.5/s) | 7.86 ms (127/s) | **13.5×** |
+| 64² × 64 k1 s1 | 3.07 ms (326/s) | 0.087 ms (11527/s) | **35.4×** |
+| 16² × 8 k3 s1 | 0.050 ms (20081/s) | 0.004 ms (267295/s) | **13.3×** |
+
+> 深度卷积加速来自「跨通道 16 路 AVX-512 向量化」替代逐通道标量点积：权重预转置 `wT[K·16]` 驻留 L1、
+> 每输出像素对 `KH·KW` 个空间偏移各做 16 路 `_mm512_fmadd_ps`；尾通道与 padding 以 AVX-512 掩码
+> load/store 归零，消除全部边界分支。大输入/大通道收益最高（13–36×），极小图（16²×8）受 AVX-512
+> 启动与掩码开销影响仍有 13×。
+
+**分组卷积 acfun_conv2d_g vs 朴素分组参考（全部 `max|Δ|<4e-6`）**：
+
+| 配置 | 标量参考 | 分组 (AVX-512) | 加速 |
+|------|----------|----------------|------|
+| 56² × 16→32 k3 g4 | 4.75 ms (211/s) | 1.93 ms (520/s) | **2.5×** |
+| 28² × 32→64 k1 g8 | 0.79 ms (1274/s) | 0.22 ms (4656/s) | **3.7×** |
+| 14² × 24→48 k3 g6 | 0.11 ms (9392/s) | 0.064 ms (15724/s) | **1.7×** |
+| 56² × 32→32 k3 g32 | 3.28 ms (305/s) | 0.10 ms (9851/s) | **32.3×** |
+
+> `groups==Cin==Cout` 自动路由到深度卷积（零额外开销）；其余分组按组抽取连续缓冲后复用既有
+> 1×1 / Winograd / im2col 子路径，与之同速（见 `bench_grouped`）。32 组纯深度卷积较朴素分组参考
+> 达 32×，低频组（g4/g8）受每组建模开销影响约 2–4×。
+
 ---
 
 ## 与 MNN 的对比（实事求是）
@@ -395,7 +459,11 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   **INT8 GEMM（AVX-512 VNNI `vpdpbusd`，`max|Δ|=0` 对标标量参考，~90 GOPS / MT 加速 1.7–6.5×）**、
   **INT8 量化卷积（`im2col+INT8 GEMM` + 零点偏置校正，随机权重最坏情形相对误差 <8%，真实模型通常 <1%）**、
   **INT8 Winograd 3×3 快速卷积（整数域 F(2,3)，AVX-512 `vpmaddwd`，较 im2col+INT8 GEMM 提速 5–10×、
-  逼近 float 卷积本体 0.6–1.2×、`max|Δ|/范数<0.6%` 全部 OK）**。
+  逼近 float 卷积本体 0.6–1.2×、`max|Δ|/范数<0.6%` 全部 OK）**、
+  **深度卷积（逐通道）AVX-512 跨通道 16 路向量化（`acfun_conv2d_dw`，较朴素直乘 ~6–36×、
+  `max|Δ|<1e-6`，padding 掩码归零、尾通道掩码 load/store）**、
+  **分组卷积（通用 groups，含 BN 折叠组感知；`groups==Cin==Cout` 自动路由深度卷积，否则各组复用
+  1×1/Winograd/im2col 子路径，较朴素分组参考 ~1.7–32×、`max|Δ|<4e-6`，模型 type 7 已支持）**。
 - ✅ 单线程效率：AVX-512 参考主机实测 **~75–90%** 单核 FMA 峰值（EPYC 9754 Zen4c 真实峰值
   ~83 GFLOPS/核），已进入 MNN 同量级单线程效率区间；当前 AVX2 开发沙箱单线程 GEMM ~32 GFLOPS。
 - 🚧 差距与路线：移动端 **ARM NEON** 后端、按硬件的
@@ -420,8 +488,10 @@ src/winograd.cpp        Winograd F(2,3) 3×3 快速卷积（自动路由，标�
 src/winograd_avx2.cpp   Winograd 累加内层 AVX2+FMA 向量化（-mavx2 -mfma 独立单元）
 src/winograd_avx512.cpp Winograd 累加内层 AVX-512+FMA 向量化（-mavx512f -mfma 独立单元，寄存器驻留累加 + 瓦片并行）
 src/winograd_int8.cpp   INT8 Winograd 3×3 整数域快速卷积（AVX-512 `vpmaddwd` 融合乘加，对标 MNN int8 卷积，-mavx512f -mavx512bw -mfma 独立单元）
-src/layers.cpp          卷积（含融合 ReLU / Winograd 自动路由）、全连接、激活、池化、Softmax、BN
-src/model.cpp           二进制模型加载（含 BN 折叠/ReLU 融合）与顺序执行器
+src/layers.cpp          卷积（含融合 ReLU / Winograd / 深度&分组 自动路由）、全连接、激活、池化、Softmax、BN
+src/dw.cpp              深度卷积（逐通道）标量参考 + AVX-512 派发
+src/dw_avx512.cpp       深度卷积 AVX-512 跨通道 16 路向量化内核（-mavx512f -mfma 独立单元）
+src/model.cpp           二进制模型加载（含 BN 折叠/ReLU 融合、type 7 分组卷积）与顺序执行器
 src/benchmark.cpp       正确性 + GEMM/卷积/端到端/融合 基准（含多线程扩展曲线）
 tools/gen_model.py      测试模型生成器
 ```

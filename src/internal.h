@@ -54,6 +54,17 @@ void acfun_winograd_conv3x3_avx512(const float* input, int N, int H, int W, int 
                              const float* weight, const float* bias,
                              int Cout, float* output, int act);
 
+/* 逐通道(深度)卷积: 跨通道 16 路 AVX-512 向量化 (编译单元带 -mavx512f -mfma)。
+ * weight 布局 [C, KH, KW]; 通用 -O3 标量版作可移植兜底。 */
+void acfun_conv2d_dw_avx512(const float* input, int N, int H, int W, int C,
+                            const float* weight, const float* bias,
+                            int KH, int KW, int stride, int pad,
+                            float* output, int act);
+void acfun_conv2d_dw_scalar(const float* input, int N, int H, int W, int C,
+                            const float* weight, const float* bias,
+                            int KH, int KW, int stride, int pad,
+                            float* output, int act);
+
 /* 调度器下发的期望线程数 (1 = 串行); 后端据此选择串行或 omp parallel num_threads */
 void acfun_set_num_threads_runtime(int n);
 int  acfun_get_num_threads_runtime(void);

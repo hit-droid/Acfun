@@ -61,14 +61,19 @@ struct RawLayer {
     size_t wn;        /* 权重元素总数 */
 };
 
-/* 将 BN 折叠进 Conv/FC: w'[ic][c]=w[ic][c]*scale_c, b'[c]=b[c]*scale_c+shift_c */
+/* 将 BN 折叠进 Conv/FC/分组Conv: w'[ic][c]=w[ic][c]*scale_c, b'[c]=b[c]*scale_c+shift_c。
+ * 对分组卷积 (F.p[5]=groups>1) 采用组感知索引: 全局输出通道 c 落在组 gc=c/Cout_per、
+ * 组内 oc=c%Cout_per, 其权重全局偏移 = gc*Cout_per*per_in + t*Cout_per + oc; groups=1 时退化为
+ * 原 t*Cout + c, 故本公式对普通/分组卷积统一成立。 */
 static void fold_bn_into(Layer& F, const RawLayer& bn, int Cout, size_t wn, AcfunModel* m) {
     int ch = bn.p[0];
     const float* mean  = bn.w;
     const float* var   = bn.w + ch;
     const float* gamma = bn.w + 2 * ch;
     const float* beta  = bn.w + 3 * ch;
-    size_t per_oc = wn / (size_t)Cout;       /* 每个输出通道的输入元素数 */
+    int groups   = F.p[5];
+    int Cout_per = (groups > 1) ? Cout / groups : Cout;
+    size_t per_in = wn / (size_t)Cout;        /* 每个输出通道的权重元素数 (含分组: KH*KW*Cin_per) */
     float* nw = (float*)malloc(wn * sizeof(float));
     float* nb = (float*)malloc((size_t)Cout * sizeof(float));
     if (!nw || !nb) { free(nw); free(nb); return; }
@@ -76,7 +81,12 @@ static void fold_bn_into(Layer& F, const RawLayer& bn, int Cout, size_t wn, Acfu
     for (int c = 0; c < Cout; ++c) {
         float scale = gamma[c] / sqrtf(var[c] + 1e-5f);
         float shift = beta[c] - mean[c] * scale;
-        for (size_t t = 0; t < per_oc; ++t) nw[t * (size_t)Cout + c] *= scale;
+        int gc = (groups > 1) ? c / Cout_per : 0;
+        int oc = (groups > 1) ? c % Cout_per : c;
+        for (size_t t = 0; t < per_in; ++t) {
+            size_t off = (size_t)gc * (size_t)Cout_per * per_in + t * (size_t)Cout_per + oc;
+            nw[off] *= scale;
+        }
         nb[c] = (F.b ? F.b[c] : 0.0f) * scale + shift;
     }
     F.w = nw; F.b = nb;
@@ -149,6 +159,21 @@ AcfunModel* acfun_model_load(const char* path) {
                     L.b=(const float*)(blob+o); o+=bn*4;
                     prevC = Cout; break;
                 }
+                case 7: { /* ConvGrouped (含深度卷积 groups==Cin==Cout) */
+                    int KH = read_u32(blob + o); o += 4;
+                    int KW = read_u32(blob + o); o += 4;
+                    int Cout = read_u32(blob + o); o += 4;
+                    int st = read_u32(blob + o); o += 4;
+                    int pd = read_u32(blob + o); o += 4;
+                    int groups = read_u32(blob + o); o += 4;
+                    L.p[0]=KH; L.p[1]=KW; L.p[2]=Cout; L.p[3]=st; L.p[4]=pd; L.p[5]=groups;
+                    L.prevC = prevC;
+                    L.wn = (size_t)KH * KW * prevC * Cout / groups;   /* = groups*Cout_per*KH*KW*Cin_per */
+                    size_t bn = Cout;
+                    L.w=(const float*)(blob+o); o+=(size_t)L.wn*4;
+                    L.b=(const float*)(blob+o); o+=bn*4;
+                    prevC = Cout; break;
+                }
                 case 3: break;                                   /* ReLU */
                 case 4: {                                        /* MaxPool */
                     int pool=read_u32(blob+o); o+=4;
@@ -175,11 +200,11 @@ AcfunModel* acfun_model_load(const char* path) {
     for (int i = 0; i < num; ++i) {
         if (consumed[i]) continue;
         RawLayer& L = raw[i];
-        if (L.type == 1 || L.type == 2) {            /* Conv / FC */
+        if (L.type == 1 || L.type == 2 || L.type == 7) {            /* Conv / FC / ConvGrouped */
             Layer F; std::memset(&F, 0, sizeof(F));
             F.type = L.type; std::memcpy(F.p, L.p, sizeof(L.p));
             F.w = L.w; F.b = L.b; F.act = 0;
-            int Cout = (L.type == 1) ? L.p[2] : L.p[0];
+            int Cout = (L.type == 2) ? L.p[0] : L.p[2];
             int j = i + 1;
             bool sawReLU = false;
             if (j < num && raw[j].type == 3) { sawReLU = true; j++; }
@@ -240,14 +265,19 @@ int acfun_model_infer(AcfunModel* m, const float* input, float* output) {
         int nH = H, nW = W, nC = C;
         size_t ncap = 0;
         switch (L->type) {
-            case 1: {   /* Conv (可选融合 ReLU) */
+            case 1:   /* Conv (可选融合 ReLU) */
+            case 7: { /* ConvGrouped / 深度卷积 (可选融合 ReLU) */
                 int KH=L->p[0], KW=L->p[1], Cout=L->p[2], st=L->p[3], pd=L->p[4];
+                int groups=L->p[5];
                 nH=(H+2*pd-KH)/st+1; nW=(W+2*pd-KW)/st+1;
                 nC=Cout; ncap=(size_t)N*nH*nW*nC;
                 int dst = 1 - m->cur;
                 float* outb = ensure_buf(m, dst, ncap);
-                if (L->act==1) acfun_conv2d_relu(cur,N,H,W,C,L->w,L->b,KH,KW,Cout,st,pd,outb);
-                else           acfun_conv2d    (cur,N,H,W,C,L->w,L->b,KH,KW,Cout,st,pd,outb);
+                if (groups > 1) {
+                    if (L->act==1) acfun_conv2d_g(cur,N,H,W,C,L->w,L->b,KH,KW,Cout,st,pd,groups,outb,1);
+                    else           acfun_conv2d_g(cur,N,H,W,C,L->w,L->b,KH,KW,Cout,st,pd,groups,outb,0);
+                } else if (L->act==1) acfun_conv2d_relu(cur,N,H,W,C,L->w,L->b,KH,KW,Cout,st,pd,outb);
+                else                  acfun_conv2d    (cur,N,H,W,C,L->w,L->b,KH,KW,Cout,st,pd,outb);
                 m->cur=dst; cur=outb;
                 break;
             }
