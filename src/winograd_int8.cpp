@@ -8,8 +8,7 @@
  *   - 乘法量从 9·Cin·Cout·4 降到 16·Cin·Cout (2.25x), 与 float Winograd 同构;
  *   - 主乘累加 M = d_hat ⊙ g_hat 为 int16×int16→int32, 带宽仅 int16 (float 的 1/2),
  *     再经反量化 (× s_in × 每通道 scale) 还原 float 输出, 量化误差与 im2col+INT8 GEMM 同量级;
- *   - 完全跳过 im2col 缓冲 (float 卷积的 im2col 在 int8 下虽省 4x 带宽, 仍要多一次展开拷贝),
- *     Winograd 直接以 4x4 输入块做整数变换, 算术强度更高。
+ *   - 完全跳过 im2col 缓冲, Winograd 直接以 4x4 输入块做整数变换, 算术强度更高。
  *
  * 整数变换推导 (全部线性, 无新增乘法):
  *   输入 d_hat = BT·d·BTᵀ (BT 整数), 权重 g_hat = G·g·Gᵀ (G 含 0.5)。为消除 0.5 引入小数,
@@ -30,6 +29,13 @@
  *     对在 16 个 o 上的交错值 (g[c][o], g[c+1][o]), 以 (dh[c],dh[c+1]) 打包广播作乘子, vpmaddwd 即
  *     产出该对的 16 路 o 累加 —— 单指令完成 2 个 c, 较逐 c 的「符号扩展+vpmulld」省约 2.5x 指令, 且
  *     数据仍是 int16 (带宽仅 float 之半)。奇数 Cin 余 1 个 c 时乘子高 16 置 0 单独处理。
+ *   - 输出变换 Y=(s_in·s_w[o]/4)·(AT·T4·ATᵀ) 为本版重点提速对象: 沿用 v0.6.0 float 路线, 改为
+ *     512-bit scatter-add (4 个输出元素各持 16 路 int64 累加器, 对 16 个变换域元素按预计算符号表
+ *     做 vpsub/vpadd), 消除标量 16×4×4 输出的 ILP 受限与零系数分支 —— 这是 INT8 卷积从「慢于 float」
+ *     逼近「比肩 float」的关键。
+ *   - 输入量化融合: 此前 conv_int8 需先对整张输入做一遍 lroundf 量化 (inQ), 再由本函数 memcpy 进
+ *     填充缓冲, 等于两遍扫描输入。本版改由本函数在填充缓冲时 **就地量化** (AVX-512 向量化、
+ *     round-half-away 与 lroundf 逐位一致), 彻底省去整张输入的独立量化遍与 inQ 中间缓冲。
  *   - 跨输出瓦片 (ty,tx) 做 OpenMP 并行, g_hat2/Sgh (权重相关, 只读) 与 pad (逐图填充后只读)
  *     跨线程共享。本 TU 编译带 -mavx512f -mavx512bw -mfma, 由 conv_int8 在检测到 avx512f 时路由。 */
 #include "acfun.h"
@@ -95,6 +101,75 @@ static int32_t* t4_scratch(int Cout_up) {
     return buf.data();
 }
 
+/* 输出变换符号表: SIGN[e][ij] = AT[r][i]·AT[c][j] (r=e/2, c=e%2), 仅取 ±1 与 0。
+ * e=0..3 对应输出元素 (r,c)∈{(0,0),(0,1),(1,0),(1,1)}; ij=i*4+j。与标量输出变换逐位等价。 */
+static const int8_t (&int8_wino_signs())[4][16] {
+    static int8_t S[4][16];
+    static bool done = false;
+    if (!done) {
+        static const int AT[2][4] = {{1, 1, 1, 0}, {0, 1, -1, 1}};
+        for (int e = 0; e < 4; ++e) {
+            int r = e >> 1, c = e & 1;
+            for (int ij = 0; ij < 16; ++ij) {
+                int i = ij >> 2, j = ij & 3;
+                S[e][ij] = (int8_t)(AT[r][i] * AT[c][j]);
+            }
+        }
+        done = true;
+    }
+    return S;
+}
+
+/* 单 o 块 (16 路) 输出变换: Y = (s_in·s_w[o]/4)·(AT·T4·ATᵀ) + bias, int64 累加防溢出。
+ * 4 个输出元素各持 16 路 int64 累加器 (2 zmm), 对 16 个变换域元素按符号表 vpsub/vpadd, 末了
+ * int64→float 乘 wso 加 bias (+ReLU) 写回。wscale/bias 已补齐到 Cout_up (避免越界读), 仅在
+ * o<Cout 的通道写回 (掩码)。 */
+inline void wino_output_block_int8(const int32_t* T4, int Cout_up, int ob, int Cout,
+                                   const float* wscale, const float* bias, int act,
+                                   float s_in, float* yo, int OH, int OW,
+                                   int oh0, int ow0) {
+    static const int8_t (&S)[4][16] = int8_wino_signs();
+    __m512i acc[4][2];
+    for (int e = 0; e < 4; ++e) {
+        acc[e][0] = _mm512_setzero_si512();
+        acc[e][1] = _mm512_setzero_si512();
+    }
+    for (int ij = 0; ij < 16; ++ij) {
+        __m512i t32 = _mm512_loadu_si512((const __m512i*)&T4[(size_t)ij * Cout_up + ob]);
+        __m256i lo32 = _mm512_castsi512_si256(t32);
+        __m256i hi32 = _mm512_extracti32x8_epi32(t32, 1);
+        __m512i lo64 = _mm512_cvtepi32_epi64(lo32);   /* 通道 o..o+7 */
+        __m512i hi64 = _mm512_cvtepi32_epi64(hi32);   /* 通道 o+8..o+15 */
+        for (int e = 0; e < 4; ++e) {
+            int8_t sgn = S[e][ij];
+            if (sgn > 0) {
+                acc[e][0] = _mm512_add_epi64(acc[e][0], lo64);
+                acc[e][1] = _mm512_add_epi64(acc[e][1], hi64);
+            } else if (sgn < 0) {
+                acc[e][0] = _mm512_sub_epi64(acc[e][0], lo64);
+                acc[e][1] = _mm512_sub_epi64(acc[e][1], hi64);
+            }
+        }
+    }
+    __m512 wsc = _mm512_loadu_ps(&wscale[ob]);
+    __m512 wso = _mm512_mul_ps(_mm512_set1_ps(s_in * 0.25f), wsc);
+    __m512 bv  = bias ? _mm512_loadu_ps(&bias[ob]) : _mm512_setzero_ps();
+    int nvalid = Cout - ob; if (nvalid > 16) nvalid = 16; if (nvalid < 0) nvalid = 0;
+    __mmask16 fullmask = (__mmask16)((nvalid >= 16) ? 0xFFFFu : ((1u << nvalid) - 1u));
+    for (int e = 0; e < 4; ++e) {
+        int oh = oh0 + (e >> 1), ow = ow0 + (e & 1);
+        if (oh >= OH || ow >= OW) continue;
+        /* acc[e][0/1] 各 8 个 int64, 分别转 8 个 float 后合并为 16 路 vf (低 8=o..o+7, 高 8=o+8..o+15) */
+        __m256 f0 = _mm512_cvtepi64_ps(acc[e][0]);
+        __m256 f1 = _mm512_cvtepi64_ps(acc[e][1]);
+        __m512 vf = _mm512_insertf32x8(_mm512_castps256_ps512(f0), f1, 1);
+        vf = _mm512_fmadd_ps(vf, wso, bv);
+        if (act == 1) vf = _mm512_max_ps(vf, _mm512_setzero_ps());
+        float* dst = yo + (size_t)(oh * OW + ow) * Cout + ob;
+        _mm512_mask_storeu_ps(dst, fullmask, vf);
+    }
+}
+
 /* 单瓦片计算 (2x2 输出块)。g_hat2/Sgh (只读, 权重相关, 交错布局) 与 pad (只读) 跨线程共享;
  * dhq/T4 为线程私有 scratch。输入变换在瓦片内联完成, 使 d_hat 驻留 L1 (缓存友好)。 */
 static void wino_tile_int8(int ty, int tx, int OH, int OW, int Cin, int Cout, int Cout_up, int num_pairs, int act,
@@ -128,83 +203,48 @@ static void wino_tile_int8(int ty, int tx, int OH, int OW, int Cin, int Cout, in
      *    (g[c][o],g[c+1][o]) 交错, 乘子 A 以 (dh[c],dh[c+1]) 打包广播, vpmaddwd 即产出该组 16 路 o 累加。 */
     const int32_t qcorr5 = (int32_t)ZP * 4;   /* ij==5 时的激活零点校正系数 zp·Q[5] (Q[5]=4) */
     for (int ob = 0; ob < Cout_up; ob += 16) {
-        __m512i acc[16];
-        for (int ij = 0; ij < 16; ++ij) acc[ij] = _mm512_setzero_si512();
-        int c = 0;
-        for (; c + 1 < Cin; c += 2) {                       /* vpmaddwd 成对处理 (c, c+1) */
-            for (int ij = 0; ij < 16; ++ij) {
+        for (int ij = 0; ij < 16; ++ij) {
+            __m512i acc = _mm512_setzero_si512();
+            int c = 0;
+            for (; c + 1 < Cin; c += 2) {                       /* vpmaddwd 成对处理 (c, c+1) */
                 const int16_t* gp = &g_hat2[((size_t)(ij * num_pairs + (c >> 1)) * 2 * Cout_up) + (2 * ob)];
                 __m512i B = _mm512_loadu_si512((const __m512i*)gp);
                 int16_t dhc  = dh[(size_t)ij * Cin + c];
                 int16_t dhc1 = dh[(size_t)ij * Cin + c + 1];
                 int32_t ap = ((int32_t)dhc1 << 16) | (uint16_t)dhc;   /* (dh[c+1], dh[c]) 打包 */
                 __m512i A = _mm512_set1_epi32(ap);
-                acc[ij] = _mm512_add_epi32(acc[ij], _mm512_madd_epi16(A, B));
+                acc = _mm512_add_epi32(acc, _mm512_madd_epi16(A, B));
             }
-        }
-        if (c < Cin) {                                      /* 奇数 Cin 余 1 个 c: 乘子高 16 置 0 */
-            for (int ij = 0; ij < 16; ++ij) {
+            if (c < Cin) {                                      /* 奇数 Cin 余 1 个 c: 乘子高 16 置 0 */
                 const int16_t* gp = &g_hat2[((size_t)(ij * num_pairs + (c >> 1)) * 2 * Cout_up) + (2 * ob)];
                 __m512i B = _mm512_loadu_si512((const __m512i*)gp);
                 int16_t dhc = dh[(size_t)ij * Cin + c];
                 int32_t ap = (uint16_t)dhc;                 /* 高 16 = 0 => vpmaddwd 仅留 dhc·g[c][o] */
                 __m512i A = _mm512_set1_epi32(ap);
-                acc[ij] = _mm512_add_epi32(acc[ij], _mm512_madd_epi16(A, B));
+                acc = _mm512_add_epi32(acc, _mm512_madd_epi16(A, B));
             }
-        }
-        /* 写回 T4, 并对 ij==5 减去激活零点校正 qcorr5·Sgh[ij][o] (其余 ij 无需校正) */
-        for (int ij = 0; ij < 16; ++ij) {
-            __m512i v = acc[ij];
             if (ij == 5) {
                 __m512i sg = _mm512_loadu_si512((const __m512i*)&Sgh[(size_t)ij * Cout_up + ob]);
-                v = _mm512_sub_epi32(v, _mm512_mullo_epi32(_mm512_set1_epi32(qcorr5), sg));
+                acc = _mm512_sub_epi32(acc, _mm512_mullo_epi32(_mm512_set1_epi32(qcorr5), sg));
             }
-            _mm512_storeu_si512((__m512i*)&T4[(size_t)ij * Cout_up + ob], v);
+            _mm512_storeu_si512((__m512i*)&T4[(size_t)ij * Cout_up + ob], acc);
         }
-    }
 
-    /* 3) 输出变换 Y = (s_in·s_w[o]/4)·(AT·T4·ATᵀ) + bias, 整数域 int64 累加防溢出。
-     *    AT (2x4) = [[1,1,1,0],[0,1,-1,1]]; 故 AT·M·ATᵀ = Σ_iΣ_j AT[r][i]·M[i*4+j]·AT[c][j]。
-     *    仅遍历有效输出通道 o∈[0,Cout), 跳过补齐区 (恒为 0, 不会被读)。 */
-    static const int ATi[2][4] = {{1, 1, 1, 0}, {0, 1, -1, 1}};
-    float* yo = output + (size_t)n * OH * OW * Cout;
-    for (int o = 0; o < Cout; ++o) {
-        int64_t S[4];
-        for (int r = 0; r < 2; ++r) {
-            for (int cc = 0; cc < 2; ++cc) {
-                int64_t s = 0;
-                for (int i = 0; i < 4; ++i) {
-                    int si = ATi[r][i]; if (!si) continue;
-                    for (int j = 0; j < 4; ++j) {
-                        int sj = ATi[cc][j]; if (!sj) continue;
-                        s += (int64_t)si * (int64_t)sj * (int64_t)T4[((size_t)(i * 4 + j)) * Cout_up + o];
-                    }
-                }
-                S[r * 2 + cc] = s;
-            }
-        }
-        float wso = s_in * wscale[o] * 0.25f;   /* /4: g_hat2 的 ×4 缩放 + 输出变换归一 */
-        float b = bias ? bias[o] : 0.0f;
-        for (int r = 0; r < 2; ++r) {
-            int oh = oh0 + r; if (oh >= OH) continue;
-            for (int cc = 0; cc < 2; ++cc) {
-                int ow = ow0 + cc; if (ow >= OW) continue;
-                float v = wso * (float)S[r * 2 + cc] + b;
-                if (act == 1 && v < 0.0f) v = 0.0f;
-                yo[((size_t)(oh * OW + ow)) * Cout + o] = v;
-            }
-        }
+        /* 3) 512-bit 向量化输出变换 (scatter-add, int64 累加) —— 本版提速重点 */
+        float* yo = output + (size_t)n * OH * OW * Cout;   /* 按 batch 偏移到本图输出基址 */
+        wino_output_block_int8(T4, Cout_up, ob, Cout, wscale, bias, act, s_in, yo, OH, OW, oh0, ow0);
     }
 }
 
 } /* namespace */
 
-/* INT8 Winograd F(2,3) 卷积主体: 3x3 / stride1 / pad1, NHWC, uint8 输入 (零点 zp=128)。
+/* INT8 Winograd F(2,3) 卷积主体: 3x3 / stride1 / pad1, NHWC, float 输入 (本函数内就地量化, 零点 zp=128)。
  * 权重 wq 为逐通道量化 int8 (布局 [KH*KW*Cin * Cout], 即 [((k*Cin+c)*Cout)+o])。
+ * inv_s = 127/max|x| (与 conv_int8 量化步长严格一致, 故 x_q = round(x·inv_s)+ZP)。
  * 要求 H>=3 && W>=3 && Cin>=4 && Cout>=4; act=1 融合 ReLU。bias 为 [Cout], 可为 NULL。 */
-void acfun_winograd_conv3x3_int8(const uint8_t* input, int N, int H, int W, int Cin,
+void acfun_winograd_conv3x3_int8(const float* input, int N, int H, int W, int Cin,
                                  const int8_t* wq, const float* wscale, const float* bias, int Cout,
-                                 float s_in, float* output, int act) {
+                                 float s_in, float inv_s, float* output, int act) {
     const int OH = H, OW = W;                  /* s1 p1 => 输出同尺寸 */
     const int tH = (OH + 1) / 2;               /* 2x2 输出瓦片数 (向上取整) */
     const int tW = (OW + 1) / 2;
@@ -230,10 +270,19 @@ void acfun_winograd_conv3x3_int8(const uint8_t* input, int N, int H, int W, int 
         }
     }
 
-    /* 带 1 像素 0 填充的输入缓冲 (尺寸 (H+2)x(W+2)xCin); 边界瓦片越界读取自然为零点 zp。 */
+    /* wscale/bias 补齐到 Cout_up, 供向量化输出变换按 16 路整块读取 (避免 o>=Cout 越界读); 输出
+     * 仅写回 o<Cout 通道 (掩码), 补齐区恒为 0 不会被读。 */
+    std::vector<float> wscale_up(Cout_up, 0.0f), bias_up(Cout_up, 0.0f);
+    for (int o = 0; o < Cout; ++o) { wscale_up[o] = wscale[o]; bias_up[o] = bias ? bias[o] : 0.0f; }
+
+    /* 带 1 像素 0 填充的输入缓冲 (尺寸 (H+2)x(W+2)xCin); 边界瓦片越界读取自然为零点 zp=128 —— 反量化
+     * 后恰好还原 float 0, 否则边缘会被错读成 -s_in·128 而污染全部输出 (此前数值错误的根因)。 */
     std::vector<uint8_t> pad((size_t)(H + 2) * (W + 2) * Cin);
     const int pstride = (W + 2) * Cin;
     const int ZP = 128;
+    const __m512i vzp = _mm512_set1_epi32(ZP);
+    const __m512 vinv = _mm512_set1_ps(inv_s);
+    const __m512 vhalf = _mm512_set1_ps(0.5f);
 
     const long long work = (long long)Cin * Cout * OH * OW;
     const int PARALLEL = (work >= 8000000LL);
@@ -242,14 +291,39 @@ void acfun_winograd_conv3x3_int8(const uint8_t* input, int N, int H, int W, int 
     if (nth < 1) nth = 1;
 
     for (int n = 0; n < N; ++n) {
-        const uint8_t* x = input + (size_t)n * H * W * Cin;
-        /* 零填充在 uint8 域必须为零点 zp (=128): 反量化后恰好还原 float 0, 否则边缘会
-         * 被错读成 -s_in·128 而污染全部输出 (这是此前数值错误的根因)。 */
+        const float* x = input + (size_t)n * H * W * Cin;
+        /* 零填充在 uint8 域必须为零点 zp (=128): 反量化后恰好还原 float 0。 */
         std::memset(pad.data(), (uint8_t)ZP, pad.size() * sizeof(uint8_t));
         for (int ih = 0; ih < H; ++ih)
-            for (int iw = 0; iw < W; ++iw)
-                std::memcpy(&pad[((size_t)(ih + 1) * (W + 2) + (iw + 1)) * Cin],
-                            x + ((size_t)ih * W + iw) * Cin, Cin * sizeof(uint8_t));
+            for (int iw = 0; iw < W; ++iw) {
+                uint8_t* dst = &pad[((size_t)(ih + 1) * (W + 2) + (iw + 1)) * Cin];
+                const float* xrow = x + ((size_t)ih * W + iw) * Cin;
+                int c = 0;
+                /* 就地量化 (向量化, round-half-away 与 lroundf 逐位一致):
+                 * t = x·inv_s; r = t + 0.5·sign(t); ri = trunc(r) = round-half-away(t); 再 +ZP 并 clamp 到 [0,255]。
+                 * 注意: 必须先用 128-bit packus 把 ri16 的「低 128 位 + 高 128 位」打包成 16 个 uint8,
+                 * 不能用 _mm256_packus_epi16(ri16,ri16)+cast(低128): 那样会丢弃 ri[8..15]、且把 ri[0..7] 重复两遍。 */
+                for (; c + 16 <= Cin; c += 16) {
+                    __m512 xv = _mm512_loadu_ps(xrow + c);
+                    __m512 t  = _mm512_mul_ps(xv, vinv);                 /* t = x·inv_s */
+                    __m512 sgn = _mm512_castsi512_ps(
+                        _mm512_and_si512(_mm512_castps_si512(t), _mm512_set1_epi32(0x80000000u)));
+                    __m512 r = _mm512_add_ps(t, _mm512_or_ps(vhalf, sgn)); /* t + 0.5·sign(t) → 半数远离取整 */
+                    __m512i ri = _mm512_cvttps_epi32(r);                  /* round-half-away(t) (与 lroundf 逐位一致) */
+                    ri = _mm512_add_epi32(ri, vzp);                       /* + 零点 ZP (整数域, 避免偏移破坏截断恒等式) */
+                    ri = _mm512_max_epi32(ri, _mm512_setzero_si512());
+                    ri = _mm512_min_epi32(ri, _mm512_set1_epi32(255));
+                    __m256i ri16 = _mm512_cvtepi32_epi16(ri);            /* 低 16 个 int32 → 16 int16 */
+                    __m128i ri8  = _mm_packus_epi16(_mm256_castsi256_si128(ri16),
+                                                    _mm256_extracti128_si256(ri16, 1));  /* 16 uint8 (低128+高128) */
+                    _mm_storeu_si128((__m128i*)(dst + c), ri8);
+                }
+                for (; c < Cin; ++c) {                                   /* 尾通道标量兜底 */
+                    int v = (int)std::lroundf(xrow[c] * inv_s) + ZP;
+                    if (v < 0) v = 0; else if (v > 255) v = 255;
+                    dst[c] = (uint8_t)v;
+                }
+            }
         const uint8_t* pbase = pad.data();
 
         /* 逐瓦片计算: 输入变换在瓦片内联完成 (d_hat 驻留 L1), 输出直接写回。 */
@@ -260,7 +334,7 @@ void acfun_winograd_conv3x3_int8(const uint8_t* input, int N, int H, int W, int 
                 #pragma omp for collapse(2) schedule(static)
                 for (int ty = 0; ty < tH; ++ty)
                     for (int tx = 0; tx < tW; ++tx)
-                        wino_tile_int8(ty, tx, OH, OW, Cin, Cout, Cout_up, num_pairs, act, bias, wscale,
+                        wino_tile_int8(ty, tx, OH, OW, Cin, Cout, Cout_up, num_pairs, act, bias_up.data(), wscale_up.data(),
                                        g_hat2.data(), Sgh.data(),
                                        pbase, pstride, s_in, T4.data(), output, n);
             }
@@ -268,7 +342,7 @@ void acfun_winograd_conv3x3_int8(const uint8_t* input, int N, int H, int W, int 
             std::vector<int32_t> T4((size_t)16 * Cout_up);
             for (int ty = 0; ty < tH; ++ty)
                 for (int tx = 0; tx < tW; ++tx)
-                    wino_tile_int8(ty, tx, OH, OW, Cin, Cout, Cout_up, num_pairs, act, bias, wscale,
+                    wino_tile_int8(ty, tx, OH, OW, Cin, Cout, Cout_up, num_pairs, act, bias_up.data(), wscale_up.data(),
                                    g_hat2.data(), Sgh.data(),
                                    pbase, pstride, s_in, T4.data(), output, n);
         }
