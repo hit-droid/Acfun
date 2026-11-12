@@ -192,12 +192,25 @@ void acfun_gemm_avx512(int M, int N, int K,
     if (M <= 0 || N <= 0 || K <= 0) return;
     int KC = 256, NC = 128, MC = 256;
     int nt = acfun_get_num_threads_runtime();
-    if (std::getenv("ACFUN_KC") || std::getenv("ACFUN_NC")) {
+    int tkc = 0, tnc = 0;
+    int have_tune = acfun_get_tuned_kc_nc(nt, &tkc, &tnc);
+    int env_kc = (std::getenv("ACFUN_KC") != nullptr);
+    int env_nc = (std::getenv("ACFUN_NC") != nullptr);
+    if (env_kc || env_nc) {
+        /* 环境变量显式覆盖: 维持原默认 MC(不走自适应), 与原行为一致 */
         KC = g_dim("ACFUN_KC", 256);
         NC = g_dim("ACFUN_NC", 128);
+        MC = 256;
+    } else if (have_tune) {
+        /* 自动调参: 采用本机实测最优 KC/NC, 并据此自适应 MC(与启发式同构) */
+        KC = tkc; NC = tnc;
+        long target = (nt > 1) ? (long)16 * nt : 1;
+        long mc_t = ((long)M * N) / (target * (long)NC);
+        if (mc_t < 64) mc_t = 64;
+        if (mc_t > 512) mc_t = 512;
+        MC = (int)(((mc_t + MR - 1) / MR) * MR);
     } else {
-        /* 自适应 MC: 以 ~16 任务/线程为目标选取瓦片大小 —— 大矩阵用大瓦片(降调度开销),
-         * 小矩阵用小瓦片(填满多核), 使 2D 任务数随矩阵与核数自适应。 */
+        /* 启发式(静态, 仅按 L2 容量): 自适应 MC + auto_blocks */
         long target = (nt > 1) ? (long)16 * nt : 1;
         long mc_t = ((long)M * N) / (target * (long)NC);
         if (mc_t < 64) mc_t = 64;

@@ -111,6 +111,35 @@ NHWC 下跨 6 行 gather、且边界瓦片填充浪费更高，**仅在 `H≥112
 
 ---
 
+### 5. GEMM 自动调参（autotuning）
+
+分块 GEMM 的 `KC`（命中 L2 的 K 分块）与 `NC`（命中 L2/L1 的 N 分块）最优值取决于具体微架构的
+缓存层级与 FMA 吞吐 —— 纯静态启发式（仅按 L2 容量推导）无法精确匹配每颗 CPU。本引擎补齐
+**运行时自动调参**（对标 MNN / OpenBLAS 的 autotuning）：
+
+- **按硬件实测最优分块**：`acfun_autotune()` 在目标机扫描一组候选 `(KC, NC)` 网格，在**多尺寸套件**
+  （单线程覆盖 256²–1024²，多线程覆盖 512²–4096²）上取**几何平均最快**者；候选受 **L2 面板拟合约束**
+  （单 MC 块 A 面板 + 单 NC 块 B 面板须稳居 L2/2），且仅当某候选在套件**全部尺寸上都不劣于启发式基线**
+  （容 3% 噪声）时才采纳 —— 从根本上杜绝"大分块撑爆 L2、中小矩阵反而变慢"的回归。
+- **持久化 + 零成本复用**：调参结果写入本地缓存（`~/.cache/acfun/acfun_tune_<host签名>.txt`，签名含
+  CPU 型号与 L2/L3 容量）。后续运行自动读取，**无需重新调参**；部署 / 换机时设 `ACFUN_AUTOTUNE=1`
+  执行一次即可。
+- **内置参考表**：常见服务端 CPU（EPYC / Xeon / Core）附保守安全默认（`KC=256 / ST-NC=96 / MT-NC=128`），
+  使同类硬件"开箱即快"，其余硬件回落静态启发式。
+- **安全性**：调参只改分块尺寸（不改变计算结果），且尾部余数处理完整，故可安全替换启发式路径；
+  任何环境（无调参 / 无缓存）都等价于原 L2 启发式，**零回归**。
+
+```bash
+ACFUN_AUTOTUNE=1 ./build/acfun_bench build/model.acfun   # 强制调参并写缓存
+./build/acfun_bench build/model.acfun                   # 后续运行自动读缓存(或参考表/启发式)
+```
+
+> 实测（本沙箱 AVX-512 Zen5，4 核 cgroup 配额）：本机 L2 充裕，L2 启发式已近优，自动调参在常见尺寸上
+> 给出单线程 GEMM **+2–5%** 的小幅提速，并确认多线程分块已近优（未改动）；在**缓存更受限的客户端 /
+> 嵌入式硬件**上收益更显著。调参能力本身是关键短板补齐。
+
+---
+
 ## 构建与测试
 
 ```bash
@@ -463,13 +492,15 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   **深度卷积（逐通道）AVX-512 跨通道 16 路向量化（`acfun_conv2d_dw`，较朴素直乘 ~6–36×、
   `max|Δ|<1e-6`，padding 掩码归零、尾通道掩码 load/store）**、
   **分组卷积（通用 groups，含 BN 折叠组感知；`groups==Cin==Cout` 自动路由深度卷积，否则各组复用
-  1×1/Winograd/im2col 子路径，较朴素分组参考 ~1.7–32×、`max|Δ|<4e-6`，模型 type 7 已支持）**。
+  1×1/Winograd/im2col 子路径，较朴素分组参考 ~1.7–32×、`max|Δ|<4e-6`，模型 type 7 已支持）**、
+  **GEMM 自动调参（autotuning：运行时按硬件实测最优 KC/NC 分块 + 多尺寸无回归门控 + 本地缓存复用 +
+  常见服务端 CPU 参考表，单线程 GEMM +2–5%、零回归）**。
 - ✅ 单线程效率：AVX-512 参考主机实测 **~75–90%** 单核 FMA 峰值（EPYC 9754 Zen4c 真实峰值
   ~83 GFLOPS/核），已进入 MNN 同量级单线程效率区间；当前 AVX2 开发沙箱单线程 GEMM ~32 GFLOPS。
-- 🚧 差距与路线：移动端 **ARM NEON** 后端、按硬件的
-  **极致自动调参 (autotuning)**、更细的图优化（算子重排/常量折叠）、多尺寸/非 1 stride 的 Winograd 变体（F(4,3) 等）。
+- 🚧 差距与路线：移动端 **ARM NEON** 后端、更细的图优化（算子重排/常量折叠）、多尺寸 / 非 1 stride 的
+  Winograd 变体（F(4,3) 已在 3×3 专用路径启用，可向更宽 stride / 非方阵推广）。
 
-下一步以在 ARM 端复现对标结果、补齐自动调参与更大 Winograd 瓦片、进一步逼近 MNN 端到端吞吐为主。
+下一步以在 ARM 端复现对标结果、深化图优化、进一步逼近 MNN 端到端吞吐为主。
 
 ---
 
@@ -483,6 +514,7 @@ src/gemm_avx2.cpp       AVX2+FMA 后端（6×16 微内核，最优 A 打包 + �
 src/gemm_avx512.cpp     AVX-512F+FMA 后端（16×16 微内核，最优 A 打包 + 三级分块）
 src/gemm_int8.cpp        INT8 GEMM 调度/派发（运行时按 VNNI 能力选择后端）
 src/gemm_int8_avx512.cpp INT8 GEMM AVX-512 VNNI 后端（vpdpbusd 微内核，-mavx512vnni 独立单元）
+src/autotune.cpp         GEMM 自动调参（候选 (KC,NC) 网格扫描 + 多尺寸无回归门控 + 本地缓存 + 参考表）
 src/conv_int8.cpp        INT8 量化卷积（im2col+INT8 GEMM + 零点偏置校正 + acfun_quantize_weights）
 src/winograd.cpp        Winograd F(2,3) 3×3 快速卷积（自动路由，标量兜底 + 运行时派发）
 src/winograd_avx2.cpp   Winograd 累加内层 AVX2+FMA 向量化（-mavx2 -mfma 独立单元）

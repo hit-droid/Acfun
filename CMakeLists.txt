@@ -16,6 +16,7 @@ add_library(acfun STATIC
     src/gemm_avx512.cpp
     src/gemm_int8.cpp
     src/gemm_int8_avx512.cpp
+    src/autotune.cpp
     src/winograd.cpp
     src/winograd_avx2.cpp
     src/winograd_avx512.cpp

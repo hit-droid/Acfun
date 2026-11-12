@@ -23,6 +23,12 @@ void acfun_set_threads(int n);
 int acfun_backend(void);
 const char* acfun_backend_name(void);
 
+/* GEMM 自动调参 (autotuning): 在目标机实测最优缓存分块 (KC/NC) 并写入本地缓存
+ * (~/.cache/acfun/)。部署/换机时设置环境变量 ACFUN_AUTOTUNE=1 执行一次即可;
+ * 调参后无需再设, 后续运行自动读取缓存(或命中内置参考表), 回落静态启发式。 */
+void acfun_autotune(void);
+const char* acfun_tune_status(void);
+
 /* ---- 核心 GEMM: C[M,N] = A[M,K] * B[K,N] (row-major) ---- */
 void acfun_gemm(int M, int N, int K,
                 const float* A, const float* B, float* C);

@@ -157,9 +157,21 @@ void acfun_gemm_avx2(int M, int N, int K,
     if (M <= 0 || N <= 0 || K <= 0) return;
     int KC = 256, NC = 128, MC = 256;
     int nt = acfun_get_num_threads_runtime();
-    if (std::getenv("ACFUN_KC") || std::getenv("ACFUN_NC")) {
+    int tkc = 0, tnc = 0;
+    int have_tune = acfun_get_tuned_kc_nc(nt, &tkc, &tnc);
+    int env_kc = (std::getenv("ACFUN_KC") != nullptr);
+    int env_nc = (std::getenv("ACFUN_NC") != nullptr);
+    if (env_kc || env_nc) {
         KC = g_dim("ACFUN_KC", 256);
         NC = g_dim("ACFUN_NC", 128);
+        MC = 256;
+    } else if (have_tune) {
+        KC = tkc; NC = tnc;
+        long target = (nt > 1) ? (long)16 * nt : 1;
+        long mc_t = ((long)M * N) / (target * (long)NC);
+        if (mc_t < 64) mc_t = 64;
+        if (mc_t > 512) mc_t = 512;
+        MC = (int)(((mc_t + MR - 1) / MR) * MR);
     } else {
         long target = (nt > 1) ? (long)16 * nt : 1;
         long mc_t = ((long)M * N) / (target * (long)NC);

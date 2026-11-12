@@ -13,6 +13,7 @@
 #include <cmath>
 #include <vector>
 #include <random>
+#include <algorithm>
 
 static double now() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -64,10 +65,18 @@ static void bench_gemm() {
         double gf = 2.0 * M * N * K;
 
         auto time_it = [&](void (*f)(int,int,int,const float*,const float*,float*), int reps) {
-            double t0 = now();
-            for (int r = 0; r < reps; ++r) f(M, N, K, A.data(), B.data(), C.data());
-            double t1 = now();
-            return (t1 - t0) / reps;
+            /* 多次热身 + 中位数计时: 沙箱 cgroup/频率波动下降低噪声, 取中位数而非均值,
+             * 避免偶发调度抖动污染吞吐读数。 */
+            for (int w = 0; w < 3; ++w) f(M, N, K, A.data(), B.data(), C.data());
+            std::vector<double> ts;
+            for (int r = 0; r < reps; ++r) {
+                double t0 = now();
+                f(M, N, K, A.data(), B.data(), C.data());
+                double t1 = now();
+                ts.push_back(t1 - t0);
+            }
+            std::sort(ts.begin(), ts.end());
+            return ts[ts.size() / 2];
         };
         int reps = (S >= 1024) ? 5 : 20;
         double tnaive = time_it(acfun_gemm_ref, reps);
@@ -696,7 +705,14 @@ static void bench_int8_winograd() {
 }
 
 int main(int argc, char** argv) {
+    bool do_tune = false;
+    for (int i = 1; i < argc; ++i) if (std::strcmp(argv[i], "--tune") == 0) do_tune = true;
     printf("Acfun 推理引擎基准  |  后端: %s\n", acfun_backend_name());
+    if (do_tune) {
+        printf(">>> 执行 GEMM 自动调参 (ACFUN_AUTOTUNE) ...\n");
+        acfun_autotune();
+    }
+    printf(">>> GEMM 调参状态: %s\n", acfun_tune_status());
     int fails = correctness();
     bench_gemm();
     bench_gemm_scale();

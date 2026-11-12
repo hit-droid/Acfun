@@ -90,6 +90,12 @@ void acfun_winograd_conv3x3_int8(const float* input, int N, int H, int W, int Ci
                                  const int8_t* wq, const float* wscale, const float* bias, int Cout,
                                  float s_in, float inv_s, float* output, int act);
 
+/* ---- GEMM 自动调参 (autotuning): 运行时按硬件实测最优缓存分块 KC/NC ----
+ * 返回 1 表示取到调参值(来自本地缓存或参考表), 0 表示无调参、回落静态启发式。
+ * nt>1 取多线程调参, 否则取单线程调参。 */
+int  acfun_get_tuned_kc_nc(int nt, int* KC, int* NC);
+const char* acfun_tune_status(void);
+
 /* 生效核心数: 取物理核数与 cgroup CPU 配额(cpu.max / cfs_quota)的较小值,
  * 避免多线程在受限容器内争抢导致上下文切换风暴 (例如 16 线程抢 4 核配额)。
  * 无 cgroup 限制时回退物理核数。供 GEMM/卷积并行区设置 num_threads 上限。 */
