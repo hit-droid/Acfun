@@ -245,14 +245,16 @@ void acfun_gemm_avx512(int M, int N, int K,
 
     #pragma omp parallel num_threads(nt)
     {
-        /* Phase 1 — 并行打包 A (按 m0) 与 B (按 n0), 各自仅一次 */
-        #pragma omp for schedule(dynamic, 1) nowait
+        /* Phase 1 — 并行打包 A (按 m0) 与 B (按 n0), 各自仅一次。
+         * 用 static 连续分块: 每个线程拿到连续的一批 m0/n0, 避免 dynamic 中央任务队列锁竞争
+         * (线程越多越严重, 曾导致 8T 后吞吐反降) 与瓦片散落引发的面板缓存颠簸。 */
+        #pragma omp for schedule(static) nowait
         for (int mid = 0; mid < mb; ++mid) {
             int m0 = mid * MC;
             int mc = std::min(MC, M - m0);
             packA_all(Apool + (size_t)mid * MC * K, A, m0, mc, K, MC);
         }
-        #pragma omp for schedule(dynamic, 1) nowait
+        #pragma omp for schedule(static) nowait
         for (int nid = 0; nid < nb; ++nid) {
             int n0 = nid * NC;
             int nc = std::min(NC, N - n0);
@@ -260,8 +262,11 @@ void acfun_gemm_avx512(int M, int N, int K,
         }
         #pragma omp barrier
 
-        /* Phase 2 — 并行计算 2D 瓦片网格 (共享只读 A/B 面板) */
-        #pragma omp for schedule(dynamic, 1)
+        /* Phase 2 — 并行计算 2D 瓦片网格 (共享只读 A/B 面板)。
+         * static 连续分块使每个线程拿到连续瓦片带 (方阵下即连续若干行 m0 行块), 只触及少数
+         * A 面板 (稳居本核 L2), B 面板共享只读流式复用; 同时消除 dynamic 中央任务队列锁竞争,
+         * 在真实多核机上近线性扩展 (cgroup 受限机上则受配额封顶, 见 acfun_gemm)。 */
+        #pragma omp for schedule(static)
         for (int t = 0; t < mb * nb; ++t) {
             int mid = t / nb;
             int nid = t % nb;
