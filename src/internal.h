@@ -94,6 +94,8 @@ void acfun_winograd_conv3x3_int8(const float* input, int N, int H, int W, int Ci
  * 返回 1 表示取到调参值(来自本地缓存或参考表), 0 表示无调参、回落静态启发式。
  * nt>1 取多线程调参, 否则取单线程调参。 */
 int  acfun_get_tuned_kc_nc(int nt, int* KC, int* NC);
+/* INT8 GEMM 调参查询 (v1.0.0 新增): 返回 1 表示取到调参值(缓存或参考表), 0 表示回落启发式 */
+int  acfun_get_tuned_kc_nc_int8(int nt, int* KC, int* NC);
 const char* acfun_tune_status(void);
 
 /* 生效核心数: 取物理核数与 cgroup CPU 配额(cpu.max / cfs_quota)的较小值,

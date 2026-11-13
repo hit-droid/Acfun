@@ -48,6 +48,33 @@ static int correctness() {
     return fails;
 }
 
+/* ---------- 1b) INT8 GEMM 正确性 (对标标量参考, 整数运算应精确相等) ---------- */
+static int correctness_int8() {
+    printf("\n=== INT8 GEMM 正确性 (acfun_gemm_int8 vs 标量参考) ===\n");
+    int fails = 0;
+    /* 含非整除边界的尺寸; uint8×int8 为精确整数乘法, max|Δ| 应为 0 */
+    int sizes[] = { 63, 100, 255, 512, 1023 };
+    for (int S : sizes) {
+        int M = S, N = S, K = S;
+        std::vector<uint8_t> A((size_t)M * K);
+        std::vector<int8_t>  B((size_t)K * N);
+        static std::mt19937 g(777);
+        std::uniform_int_distribution<int> da(0, 255), db(-128, 127);
+        for (auto& v : A) v = (uint8_t)da(g);
+        for (auto& v : B) v = (int8_t)db(g);
+        std::vector<int32_t> Cref((size_t)M * N), Csim((size_t)M * N);
+        acfun_gemm_int8_ref(M, N, K, A.data(), B.data(), Cref.data());
+        acfun_gemm_int8(M, N, K, A.data(), B.data(), Csim.data());
+        int64_t maxd = 0;
+        for (size_t i = 0; i < Cref.size(); ++i)
+            maxd = std::max(maxd, (int64_t)std::abs((int64_t)Cref[i] - (int64_t)Csim[i]));
+        bool ok = maxd == 0;
+        printf("  M=N=K=%4d  max|Δ|=%lld  %s\n", S, (long long)maxd, ok ? "OK" : "FAIL");
+        if (!ok) fails++;
+    }
+    return fails;
+}
+
 /* ---------- 2) GEMM 吞吐 ---------- */
 static void bench_gemm() {
     int mt_threads = 8;                 /* 内存带宽受限内核的甜点线程数 */
@@ -725,6 +752,7 @@ int main(int argc, char** argv) {
     }
     printf(">>> GEMM 调参状态: %s\n", acfun_tune_status());
     int fails = correctness();
+    fails += correctness_int8();
     bench_gemm();
     bench_gemm_scale();
     bench_conv();

@@ -496,7 +496,8 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   **分组卷积（通用 groups，含 BN 折叠组感知；`groups==Cin==Cout` 自动路由深度卷积，否则各组复用
   1×1/Winograd/im2col 子路径，较朴素分组参考 ~1.7–32×、`max|Δ|<4e-6`，模型 type 7 已支持）**、
   **GEMM 自动调参（autotuning：运行时按硬件实测最优 KC/NC 分块 + 多尺寸无回归门控 + 本地缓存复用 +
-  常见服务端 CPU 参考表，单线程 GEMM +2–5%、零回归）**。
+  常见服务端 CPU 参考表，单线程 GEMM +2–5%、零回归）**、**INT8 GEMM 自动调参（autotuning 扩展到
+  INT8 分块，与 float 同缓存持久化，单线程小/中尺寸反超 float 路径）**。
 - ✅ 单线程效率：AVX-512 参考主机实测 **~75–90%** 单核 FMA 峰值（EPYC 9754 Zen4c 真实峰值
   ~83 GFLOPS/核），已进入 MNN 同量级单线程效率区间；当前 AVX2 开发沙箱单线程 GEMM ~32 GFLOPS。
 - ✅ **GEMM 多核扩展修复（v0.9.1）**：`acfun_gemm` 默认线程数改取 `acfun_effective_cores()`
@@ -505,7 +506,8 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   改 `schedule(static)` 去锁。修正后多核近线性扩展（2048³：单线程 ~115 → 4 核 ~434 GFLOPS，
   94% 线性效率），与 MNN“按可用算力选线程”对齐。
 - 🚧 差距与路线：移动端 **ARM NEON** 后端、更细的图优化（算子重排/常量折叠）、多尺寸 / 非 1 stride 的
-  Winograd 变体（F(4,3) 已在 3×3 专用路径启用，可向更宽 stride / 非方阵推广）。
+  Winograd 变体（F(4,3) 已在 3×3 专用路径启用，可向更宽 stride / 非方阵推广）、INT8 微内核 ILP 与
+  更大 KC 的进一步压榨（当前 INT8 大矩阵受内存带宽饱和限制）。
 
 下一步以在 ARM 端复现对标结果、深化图优化、进一步逼近 MNN 端到端吞吐为主。
 
@@ -521,7 +523,7 @@ src/gemm_avx2.cpp       AVX2+FMA 后端（6×16 微内核，最优 A 打包 + �
 src/gemm_avx512.cpp     AVX-512F+FMA 后端（16×16 微内核，最优 A 打包 + 三级分块）
 src/gemm_int8.cpp        INT8 GEMM 调度/派发（运行时按 VNNI 能力选择后端）
 src/gemm_int8_avx512.cpp INT8 GEMM AVX-512 VNNI 后端（vpdpbusd 微内核，-mavx512vnni 独立单元）
-src/autotune.cpp         GEMM 自动调参（候选 (KC,NC) 网格扫描 + 多尺寸无回归门控 + 本地缓存 + 参考表）
+src/autotune.cpp         GEMM / INT8 GEMM 自动调参（候选 (KC,NC) 网格扫描 + 多尺寸无回归门控 + 本地缓存 + 参考表；float 与 INT8 同缓存持久化）
 src/conv_int8.cpp        INT8 量化卷积（im2col+INT8 GEMM + 零点偏置校正 + acfun_quantize_weights）
 src/winograd.cpp        Winograd F(2,3) 3×3 快速卷积（自动路由，标量兜底 + 运行时派发）
 src/winograd_avx2.cpp   Winograd 累加内层 AVX2+FMA 向量化（-mavx2 -mfma 独立单元）

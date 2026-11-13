@@ -105,39 +105,76 @@ static inline void kernel_int8(const uint8_t* Ap, const int8_t* Bp, int32_t* Cba
     }
 }
 
+/* 把 4 个 k 字节 (b0..b3) 展开为 16 字节: [b0 b1 b2 b3 b0 b1 b2 b3 b0 b1 b2 b3 b0 b1 b2 b3]。
+ * 微内核读取字节 16r+4c+t 应落到 A 的 v(r,t)=b_t (与列 c 无关); 本布局使 (4c+t) 处的字节恰为 b_t,
+ * 与旧打包逐字节写等价, 但一次 128-bit 存储即覆盖一个 (rb,kg) 块的 16 行字节, 较逐字节写 + memset 提速一个量级。 */
+static inline __m128i broadcast4x4(uint32_t k4) {
+    uint8_t b0 = (uint8_t)k4, b1 = (uint8_t)(k4 >> 8), b2 = (uint8_t)(k4 >> 16), b3 = (uint8_t)(k4 >> 24);
+    return _mm_set_epi8(b3,b2,b1,b0, b3,b2,b1,b0, b3,b2,b1,b0, b3,b2,b1,b0);
+}
+
 /* 打包一个 m0 行块 (扩展 4×4): 块内 p -> A[m0 + rb*MR + p/16, kg*KG + p%4]。
  * 块布局 (rb*Kg + kg): 同一 rb 的连续 kg 块在内存中相邻, 供 K 展开连续流式读取。
- * 仅 row<mc 视为有效, 其余零填充。 */
+ * 仅 row<mc 视为有效, 其余零填充。
+ * 提速: 整块有效 (全部 4 行与 4 个 k 落在校验内) 时, 对每一行取 4 个连续 k 字节构造成 16 字节
+ * 广播扇区, 4 次 128-bit 存储即覆盖整块 (旧实现为 memset(64) + 64 次逐字节写); 仅尾部块回落零感知标量。 */
 static inline void packA_int8(uint8_t* Ap, const uint8_t* A, int m0, int mc, int K, int Kup, int MCblk) {
     int Kg = Kup / KG;
-    std::memset(Ap, 0, (size_t)Kg * MCblk * CHUNK);
     for (int rb = 0; rb < MCblk; ++rb) {
         uint8_t* base = Ap + (size_t)rb * Kg * CHUNK;
+        int row0 = m0 + rb * MR;
+        bool rows_ok = (row0 + MR <= mc);
         for (int kg = 0; kg < Kg; ++kg) {
             uint8_t* cp = base + (size_t)kg * CHUNK;
-            for (int p = 0; p < CHUNK; ++p) {
-                int row = rb * MR + (p / 16);
-                int k = kg * KG + (p % 4);
-                int v = (row < mc && k < K) ? (int)A[((size_t)(m0 + row)) * K + k] : 0;
-                cp[p] = (uint8_t)v;
+            bool k_ok = ((kg + 1) * KG <= K);
+            if (rows_ok && k_ok) {
+                for (int r = 0; r < MR; ++r) {
+                    uint32_t k4 = *(const uint32_t*)&A[((size_t)(row0 + r)) * K + (size_t)kg * KG];
+                    _mm_storeu_si128((__m128i*)(cp + 16 * r), broadcast4x4(k4));
+                }
+            } else {
+                for (int p = 0; p < CHUNK; ++p) {
+                    int row = rb * MR + (p / 16);
+                    int k = kg * KG + (p % 4);
+                    int v = (row < mc && k < K) ? (int)A[((size_t)(m0 + row)) * K + k] : 0;
+                    cp[p] = (uint8_t)v;
+                }
             }
         }
     }
 }
 /* 打包一个 n0 列块 (扩展 4×4): 块内 p -> B[kg*KG + p%4, n0 + cb*NR + (p/4)%4]。
- * 块布局 (cb*Kg + kg): 连续 kg 相邻。仅 col<nc 视为有效, 其余零填充。 */
+ * 块布局 (cb*Kg + kg): 连续 kg 相邻。仅 col<nc 视为有效, 其余零填充。
+ * 提速: 整块有效时, 对每一输出列 c 跨 4 个 k 做 (stride-N) 聚集得 32 位字, 再复制到 4 个行复制位
+ * (16 次 uint32 存储覆盖整块); 较 memset(64) + 64 次逐字节写大幅减少内存事务。尾部块回落标量。 */
 static inline void packB_int8(int8_t* Bp, const int8_t* B, int n0, int nc, int K, int N, int Kup, int NCblk) {
     int Kg = Kup / KG;
-    std::memset(Bp, 0, (size_t)Kg * NCblk * CHUNK);
     for (int cb = 0; cb < NCblk; ++cb) {
         int8_t* base = Bp + (size_t)cb * Kg * CHUNK;
+        int col0 = n0 + cb * NR;
+        bool cols_ok = (col0 + NR <= nc);
         for (int kg = 0; kg < Kg; ++kg) {
             int8_t* cp = base + (size_t)kg * CHUNK;
-            for (int p = 0; p < CHUNK; ++p) {
-                int col = cb * NR + ((p / 4) % 4);
-                int k = kg * KG + (p % 4);
-                int v = (col < nc && k < K) ? (int)B[((size_t)k) * N + n0 + col] : 0;
-                cp[p] = (int8_t)v;
+            bool k_ok = ((kg + 1) * KG <= K);
+            if (cols_ok && k_ok) {
+                for (int c = 0; c < NR; ++c) {
+                    int col = col0 + c;
+                    const int8_t* bp = B + (size_t)kg * KG * N + col;
+                    uint32_t b0 = (uint32_t)(uint8_t)bp[0 * N];
+                    uint32_t b1 = (uint32_t)(uint8_t)bp[1 * N];
+                    uint32_t b2 = (uint32_t)(uint8_t)bp[2 * N];
+                    uint32_t b3 = (uint32_t)(uint8_t)bp[3 * N];
+                    uint32_t w = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+                    for (int r = 0; r < MR; ++r)
+                        *(uint32_t*)(cp + 16 * r + 4 * c) = w;
+                }
+            } else {
+                for (int p = 0; p < CHUNK; ++p) {
+                    int col = cb * NR + ((p / 4) % 4);
+                    int k = kg * KG + (p % 4);
+                    int v = (col < nc && k < K) ? (int)B[((size_t)k) * N + n0 + col] : 0;
+                    cp[p] = (int8_t)v;
+                }
             }
         }
     }
@@ -176,12 +213,23 @@ void acfun_gemm_int8_avx512(int M, int N, int K,
         KC = g_dim("ACFUN_KC", 256);
         NC = g_dim("ACFUN_NC", 256);
     } else {
-        long target = (nt > 1) ? (long)16 * nt : 1;
-        long mc_t = ((long)M * N) / (target * (long)NC);
-        if (mc_t < 64) mc_t = 64;
-        if (mc_t > 512) mc_t = 512;
-        MC = (int)(((mc_t + MR - 1) / MR) * MR);
-        auto_blocks(MC, &KC, &NC);
+        int tkc = 0, tnc = 0;
+        if (acfun_get_tuned_kc_nc_int8(nt, &tkc, &tnc)) {
+            /* 自动调参: 采用本机实测最优 KC/NC (与 float 同构的 L2 面板拟合 + 无回归门控) */
+            KC = tkc; NC = tnc;
+            long target = (nt > 1) ? (long)16 * nt : 1;
+            long mc_t = ((long)M * N) / (target * (long)NC);
+            if (mc_t < 64) mc_t = 64;
+            if (mc_t > 512) mc_t = 512;
+            MC = (int)(((mc_t + MR - 1) / MR) * MR);
+        } else {
+            long target = (nt > 1) ? (long)16 * nt : 1;
+            long mc_t = ((long)M * N) / (target * (long)NC);
+            if (mc_t < 64) mc_t = 64;
+            if (mc_t > 512) mc_t = 512;
+            MC = (int)(((mc_t + MR - 1) / MR) * MR);
+            auto_blocks(MC, &KC, &NC);
+        }
     }
     MC = (MC / MR) * MR; if (MC < MR) MC = MR;
     NC = (NC / NR) * NR; if (NC < NR) NC = NR;
