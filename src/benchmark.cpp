@@ -742,6 +742,67 @@ static void bench_int8_winograd() {
     printf("  * INT8 Winograd 较 float 卷积 乘法量降 2.25x, 带宽仅 int8/int16; 精度损失来自逐张量激活量化\n");
 }
 
+/* ---------- 8) BF16 GEMM (AVX-512 vdpbf16ps) ----------
+ * 对标 MNN 的低精度 (bf16) 推理路径: 输入/输出均为 float, 内部转 bf16 计算、f32 累加。
+ * 报告 BF16 GEMM 的 GFLOPS (同口径 2·M·N·K/t), 与 float GEMM 对比提速, 并校验数值正确性。 */
+static void bench_bf16() {
+    if (!__builtin_cpu_supports("avx512bf16")) {
+        printf("\n=== BF16 GEMM (AVX-512 vdpbf16ps) ===\n");
+        printf("  本机不支持 avx512_bf16, 跳过 (回落 acfun_gemm)\n");
+        return;
+    }
+    int mt_threads = 8;
+    const char* env = std::getenv("ACFUN_BENCH_THREADS");
+    if (env) mt_threads = std::atoi(env);
+    int eff = acfun_effective_cores();
+    if (mt_threads > eff) mt_threads = eff;
+
+    printf("\n=== BF16 GEMM 正确性 (Acfun bf16 vs 标量参考) ===\n");
+    {
+        int sizes[] = { 64, 100, 255, 512, 1023 };
+        int fails = 0;
+        for (int S : sizes) {
+            int M = S, N = S, K = S;
+            std::vector<float> A((size_t)M * K), B((size_t)K * N), Cref((size_t)M * N), Cb((size_t)M * N);
+            rand_fill(A.data(), A.size()); rand_fill(B.data(), B.size());
+            acfun_gemm_ref(M, N, K, A.data(), B.data(), Cref.data());
+            acfun_gemm_bf16(M, N, K, A.data(), B.data(), Cb.data());
+            float maxd = 0, norm = 0;
+            for (size_t i = 0; i < Cref.size(); ++i) {
+                maxd = std::max(maxd, std::fabs(Cref[i] - Cb[i]));
+                norm = std::max(norm, std::fabs(Cref[i]));
+            }
+            float rel = norm > 1e-9f ? maxd / norm : 0.0f;
+            bool ok = rel < 0.02f;   /* bf16 逐层舍入, 推理容忍度内 */
+            if (!ok) fails++;
+            printf("  M=N=K=%4d  max|Δ|/范数=%7.3e %s\n", S, rel, ok ? "OK" : "FAIL");
+        }
+        if (fails) printf("  BF16 正确性: 存在失败 (应排查打包/内核配对)\n");
+    }
+
+    printf("\n=== BF16 GEMM 吞吐 (AVX-512 vdpbf16ps, GFLOPS = 2·M·N·K/t) ===\n");
+    printf("  多线程演示线程数 = %d (可用 ACFUN_BENCH_THREADS 覆盖; 实际可用核 %d)\n", mt_threads, eff);
+    printf("%-10s %12s %12s %12s %14s\n", "M=N=K", "float-GFLOPS", "bf16-GFLOPS", "bf16/FP", "MT加速");
+    int sizes[] = { 256, 512, 1024, 2048, 4096 };
+    for (int S : sizes) {
+        int M = S, N = S, K = S;
+        std::vector<float> A((size_t)M * K), B((size_t)K * N), Cf((size_t)M * N), Cb((size_t)M * N);
+        rand_fill(A.data(), A.size()); rand_fill(B.data(), B.size());
+        double work = 2.0 * M * N * K;
+        int reps = (S >= 1024) ? 5 : 20;
+        acfun_set_threads(1); acfun_set_num_threads_runtime(1);
+        double t0 = now(); for (int r = 0; r < reps; ++r) acfun_gemm(M, N, K, A.data(), B.data(), Cf.data());
+        double tf = work / ((now() - t0) / reps) / 1e9;
+        t0 = now(); for (int r = 0; r < reps; ++r) acfun_gemm_bf16(M, N, K, A.data(), B.data(), Cb.data());
+        double tb = work / ((now() - t0) / reps) / 1e9;
+        acfun_set_num_threads_runtime(mt_threads);
+        t0 = now(); for (int r = 0; r < reps; ++r) acfun_gemm_bf16(M, N, K, A.data(), B.data(), Cb.data());
+        double tbMT = work / ((now() - t0) / reps) / 1e9;
+        printf("%-10d %12.1f %12.1f %11.1fx %13.1fx\n", S, tf, tb, tb / tf, tbMT / tb);
+    }
+    printf("  * BF16 带宽仅 float 之半、f32 累加; 与 MNN 的 bf16/int8 低精度路径同构\n");
+}
+
 int main(int argc, char** argv) {
     bool do_tune = false;
     for (int i = 1; i < argc; ++i) if (std::strcmp(argv[i], "--tune") == 0) do_tune = true;
@@ -767,6 +828,7 @@ int main(int argc, char** argv) {
     bench_conv_bn_relu_composite();
     bench_int8();
     bench_int8_winograd();
+    bench_bf16();
     printf("\n正确性: %s\n", fails == 0 ? "全部通过" : "存在失败");
     return fails == 0 ? 0 : 1;
 }
