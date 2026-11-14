@@ -101,8 +101,10 @@ NHWC 下跨 6 行 gather、且边界瓦片填充浪费更高，**仅在 `H≥112
 
 ### 3. 算子融合（图优化）
 加载期对计算图做融合，对标 MNN 的图优化：
-- **BN 折叠**：紧跟 Conv/FC 的 BatchNorm 折叠进该层的权重与偏置，推理时**整层 BN 消失**（省一次全张量读写）。
-- **ReLU 融合**：紧跟 Conv/FC 的 ReLU 在卷积输出写入时就地施加，**省去额外激活扫描**。
+- **BN 折叠**：紧跟 Conv/FC/分组Conv 的 BatchNorm 折叠进该层的权重与偏置，推理时**整层 BN 消失**（省一次全张量读写）。
+- **ReLU 融合**：紧跟 Conv/FC 的 ReLU 在卷积/全连接输出写入时就地施加，**省去额外激活扫描**。
+- **FC + ReLU 融合（`acfun_fc_relu`，v1.1.0 新增）**：全连接的「GEMM + 偏置 + ReLU」在**单次输出遍历**内完成，免去原先 GEMM 后单独再扫一遍整张输出张量做 ReLU 的开销
+  （与 `Conv+BN+ReLU` 融合同构，是 MNN 层融合思路在 FC 层的延伸）；模型执行器在 `FC→ReLU` 形态下自动走融合路径。
 - 二者结合使 `Conv → BN → ReLU` 退化为单次融合卷积。
 
 ### 4. 推理层与模型
@@ -486,7 +488,7 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   **Winograd 累加内层 AVX2 向量化**、**Winograd 累加内层 AVX-512 向量化（512-bit FMA + 寄存器驻留
   累加 + 瓦片并行 + cgroup 感知线程上限）**、**1×1 逐点卷积直接 GEMM 快路径（跳过 im2col，较朴素直乘
   ~6.5×）**、**二维 (M×N) 瓦片并行 + 自适应分块 + 内存带宽受限兜底**、序列化模型、
-  **Conv/BN/ReLU 算子融合（无分支 ReLU 融合，较分离路径 1.2×）**、**L2 感知自动分块**、正确性校验（含非整除边界）、
+  **Conv/BN/ReLU 算子融合（无分支 ReLU 融合，较分离路径 1.2×）**、**FC+ReLU 融合（`acfun_fc_relu`，单次遍历，较「FC+独立 ReLU」两遍扫描数学等价 `max|Δ|=0` 且从不更慢）**、**L2 感知自动分块**、正确性校验（含非整除边界）、
   **INT8 GEMM（AVX-512 VNNI `vpdpbusd`，`max|Δ|=0` 对标标量参考，~90 GOPS / MT 加速 1.7–6.5×）**、
   **INT8 量化卷积（`im2col+INT8 GEMM` + 零点偏置校正，随机权重最坏情形相对误差 <8%，真实模型通常 <1%）**、
   **INT8 Winograd 3×3 快速卷积（整数域 F(2,3)，AVX-512 `vpmaddwd`，较 im2col+INT8 GEMM 提速 5–10×、
@@ -505,6 +507,9 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   按物理核派发导致的**超额订阅崩溃**（此前 8T 后吞吐反降、16T 仅 ~15% 线性效率）；2D 瓦片并行
   改 `schedule(static)` 去锁。修正后多核近线性扩展（2048³：单线程 ~115 → 4 核 ~434 GFLOPS，
   94% 线性效率），与 MNN“按可用算力选线程”对齐。
+- ✅ **INT8 GEMM 多核调度对齐（v1.1.0）**：INT8 GEMM 的二维瓦片并行 / 打包循环由 `schedule(dynamic,1)` 改为
+  `schedule(static)`，与 float GEMM（v0.9.1 据此修复 8T+ 吞吐反降）同构——消除 dynamic 中央任务队列锁竞争，
+  在裸机多核（带宽充裕）与受限容器（配额封顶）下均按连续瓦片带近线性扩展，单线程路径零改动（无回归）。
 - 🚧 差距与路线：移动端 **ARM NEON** 后端、更细的图优化（算子重排/常量折叠）、多尺寸 / 非 1 stride 的
   Winograd 变体（F(4,3) 已在 3×3 专用路径启用，可向更宽 stride / 非方阵推广）、INT8 微内核 ILP 与
   更大 KC 的进一步压榨（当前 INT8 大矩阵受内存带宽饱和限制）。
@@ -529,11 +534,11 @@ src/winograd.cpp        Winograd F(2,3) 3×3 快速卷积（自动路由，标�
 src/winograd_avx2.cpp   Winograd 累加内层 AVX2+FMA 向量化（-mavx2 -mfma 独立单元）
 src/winograd_avx512.cpp Winograd 累加内层 AVX-512+FMA 向量化（-mavx512f -mfma 独立单元，寄存器驻留累加 + 瓦片并行）
 src/winograd_int8.cpp   INT8 Winograd 3×3 整数域快速卷积（AVX-512 `vpmaddwd` 融合乘加，对标 MNN int8 卷积，-mavx512f -mavx512bw -mfma 独立单元）
-src/layers.cpp          卷积（含融合 ReLU / Winograd / 深度&分组 自动路由）、全连接、激活、池化、Softmax、BN
+src/layers.cpp          卷积（含融合 ReLU / Winograd / 深度&分组 自动路由）、全连接、FC+ReLU 融合、激活、池化、Softmax、BN
 src/dw.cpp              深度卷积（逐通道）标量参考 + AVX-512 派发
 src/dw_avx512.cpp       深度卷积 AVX-512 跨通道 16 路向量化内核（-mavx512f -mfma 独立单元）
 src/model.cpp           二进制模型加载（含 BN 折叠/ReLU 融合、type 7 分组卷积）与顺序执行器
-src/benchmark.cpp       正确性 + GEMM/卷积/端到端/融合 基准（含多线程扩展曲线）
+src/benchmark.cpp       正确性 + GEMM/卷积/端到端/融合/FC+ReLU 融合 基准（含多线程扩展曲线）
 tools/gen_model.py      测试模型生成器
 ```
 

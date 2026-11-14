@@ -263,13 +263,16 @@ void acfun_gemm_int8_avx512(int M, int N, int K,
 
     #pragma omp parallel num_threads(nt)
     {
-        #pragma omp for schedule(dynamic, 1) nowait
+        /* 与 float GEMM (v0.9.1) 同构: 改用 schedule(static) 消除 dynamic 中央任务队列锁竞争
+         * (线程越多越严重, 曾导致 8T 后吞吐反降)。static 连续分块使每个线程拿到连续瓦片带,
+         * 只触及少数 A/B 面板 (稳居本核 L2), 在受限容器(配额封顶)与裸机(带宽充裕)下均近线性扩展。 */
+        #pragma omp for schedule(static) nowait
         for (int mid = 0; mid < mb; ++mid) {
             int m0 = mid * MC;
             int mc = std::min(MC, M - m0);
             packA_int8(Apool + (size_t)mid * Astride, A, m0, mc, K, Kup, MCblk);
         }
-        #pragma omp for schedule(dynamic, 1) nowait
+        #pragma omp for schedule(static) nowait
         for (int nid = 0; nid < nb; ++nid) {
             int n0 = nid * NC;
             int nc = std::min(NC, N - n0);
@@ -277,7 +280,7 @@ void acfun_gemm_int8_avx512(int M, int N, int K,
         }
         #pragma omp barrier
 
-        #pragma omp for schedule(dynamic, 1)
+        #pragma omp for schedule(static)
         for (int t = 0; t < mb * nb; ++t) {
             int mid = t / nb;
             int nid = t % nb;

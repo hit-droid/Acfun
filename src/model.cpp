@@ -287,8 +287,10 @@ int acfun_model_infer(AcfunModel* m, const float* input, float* output) {
                 nH=1; nW=1; nC=Cout; ncap=(size_t)N*nC;
                 int dst = 1 - m->cur;
                 float* outb = ensure_buf(m, dst, ncap);
-                acfun_fc(cur,N,inDim,L->w,L->b,Cout,outb);
-                if (L->act==1) acfun_relu(outb, ncap);
+                /* FC+ReLU 融合: 偏置与 ReLU 在单次遍历内完成, 省去独立 ReLU 扫描
+                 * (与 Conv+BN+ReLU 融合同构, 对标 MNN 的层融合) */
+                if (L->act==1) acfun_fc_relu(cur,N,inDim,L->w,L->b,Cout,outb);
+                else           acfun_fc(cur,N,inDim,L->w,L->b,Cout,outb);
                 m->cur=dst; cur=outb;
                 break;
             }

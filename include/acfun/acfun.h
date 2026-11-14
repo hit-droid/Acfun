@@ -74,6 +74,11 @@ void acfun_conv2d_g(const float* input, int N, int H, int W, int Cin,
 void acfun_fc(const float* input, int N, int Cin,
               const float* weight, const float* bias, int Cout, float* output);
 
+/* FC + 融合 ReLU: GEMM + 偏置 + 就地 ReLU 在单次输出遍历内完成, 省去调用方再扫一遍
+ * 整张输出张量做 ReLU 的开销 (对标 MNN 的层融合思路; 与 Conv+BN+ReLU 融合同构)。 */
+void acfun_fc_relu(const float* input, int N, int Cin,
+                   const float* weight, const float* bias, int Cout, float* output);
+
 /* 逐元素激活 */
 void acfun_relu(float* data, size_t len);
 void acfun_relu6(float* data, size_t len);

@@ -627,6 +627,41 @@ static void bench_grouped() {
     printf("  %s\n", fails==0 ? "分组卷积全部通过" : "分组卷积存在失败");
 }
 
+/* ---------- 5b) FC + 融合 ReLU: 正确性 + 提速 ----------
+ * 对比 "acfun_fc + 独立 acfun_relu (两次全张量扫描)" 与 "acfun_fc_relu (单次遍历)"。
+ * 大 FC (N 较大时输出张量可观) 下, 融合消去第二遍 ReLU 扫描的提速最明显。 */
+static void bench_fc_relu_fused() {
+    printf("\n=== FC + 融合 ReLU (单次遍历 vs 两次扫描) ===\n");
+    struct CC { int N, Cin, Cout; } cfgs[] = {
+        {1, 4096, 4096}, {64, 4096, 4096}, {256, 2048, 2048}, {1, 1024, 1024},
+    };
+    int fails = 0;
+    for (auto& c : cfgs) {
+        int N=c.N, Cin=c.Cin, Cout=c.Cout;
+        size_t inN=(size_t)N*Cin, wN=(size_t)Cin*Cout, outN=(size_t)N*Cout;
+        std::vector<float> in(inN), w(wN), b(Cout,0.1f), o_sep(outN), o_fus(outN);
+        rand_fill(in.data(), inN); rand_fill(w.data(), wN);
+        int reps = (outN > (1u<<26)) ? 5 : 20;
+        /* 分离: fc + relu */
+        double t0=now();
+        for(int r=0;r<reps;++r){
+            acfun_fc(in.data(),N,Cin,w.data(),b.data(),Cout,o_sep.data());
+            acfun_relu(o_sep.data(),outN);
+        }
+        double tSep=(now()-t0)/reps;
+        /* 融合: 单次遍历 */
+        t0=now();
+        for(int r=0;r<reps;++r)
+            acfun_fc_relu(in.data(),N,Cin,w.data(),b.data(),Cout,o_fus.data());
+        double tFus=(now()-t0)/reps;
+        float maxd=0; for(size_t i=0;i<outN;++i) maxd=std::max(maxd,std::fabs(o_sep[i]-o_fus[i]));
+        bool ok = maxd < 1e-5f; if(!ok) fails++;
+        printf("  N=%4d %dx%d  sep:%8.3fms(%7.1f/s)  fus:%8.3fms(%7.1f/s)  加速%5.2fx  max|Δ|=%9.3e %s\n",
+               N, Cin, Cout, tSep*1e3, 1.0/tSep, tFus*1e3, 1.0/tFus, tSep/tFus, maxd, ok?"OK":"FAIL");
+    }
+    printf("  %s\n", fails==0 ? "FC+ReLU 融合全部通过" : "FC+ReLU 融合存在失败");
+}
+
 /* ---------- 6) INT8 GEMM / 卷积 (AVX-512 VNNI) ----------
  * 对标 MNN int8 推理路径: uint8×int8→int32 的 vpdpbusd 累加器。
  * 报告 INT8 GEMM 的 GOPS (2·M·N·K/t, 与 float GFLOPS 同口径便于比对算力吞吐),
@@ -764,6 +799,7 @@ int main(int argc, char** argv) {
     bench_conv1x1();
     bench_depthwise();
     bench_grouped();
+    bench_fc_relu_fused();
     bench_conv_bn_relu_composite();
     bench_int8();
     bench_int8_winograd();

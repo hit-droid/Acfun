@@ -26,6 +26,18 @@ void acfun_fc(const float* input, int N, int Cin,
     }
 }
 
+void acfun_fc_relu(const float* input, int N, int Cin,
+                   const float* weight, const float* bias, int Cout, float* output) {
+    acfun_gemm(N, Cout, Cin, input, weight, output);
+    /* 偏置 + 融合 ReLU 单次遍历: 省去 acfun_fc + 独立 acfun_relu 的二次全张量扫描 */
+    for (int n = 0; n < N; ++n)
+        for (int c = 0; c < Cout; ++c) {
+            float v = output[(size_t)n * Cout + c] + (bias ? bias[c] : 0.0f);
+            if (v < 0.0f) v = 0.0f;
+            output[(size_t)n * Cout + c] = v;
+        }
+}
+
 /* im2col: 把 NHWC 输入的一块卷积展开成 [OH*OW, KH*KW*Cin] 的矩阵 */
 static void im2col(const float* in, int H, int W, int Cin,
                    int KH, int KW, int stride, int pad,
