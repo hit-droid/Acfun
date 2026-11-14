@@ -33,6 +33,13 @@ const char* acfun_tune_status(void);
 void acfun_gemm(int M, int N, int K,
                 const float* A, const float* B, float* C);
 
+/* ---- BF16 GEMM (AVX-512 BF16, vdpbf16_ps): 对标 MNN 低精度推理路径 ----
+ * 接口与 acfun_gemm 一致 (float 输入/输出), 内部将 A/B 转为 bf16 计算、以 f32 累加,
+ * 带宽需求仅 float 之半, 推理逐层输出与 float 近似等价。仅在运行时检测到 avx512_bf16
+ * 时可用; 否则请退回 acfun_gemm。 */
+void acfun_gemm_bf16(int M, int N, int K,
+                     const float* A, const float* B, float* C);
+
 /* ---- 卷积: NHWC 输入, im2col + GEMM ----
  * input : [N, H, W, Cin]
  * weight: [KH*KW*Cin, Cout]  (GEMM 权重, row-major)

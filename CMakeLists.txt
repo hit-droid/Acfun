@@ -16,6 +16,7 @@ add_library(acfun STATIC
     src/gemm_avx512.cpp
     src/gemm_int8.cpp
     src/gemm_int8_avx512.cpp
+    src/gemm_bf16_avx512.cpp
     src/autotune.cpp
     src/winograd.cpp
     src/winograd_avx2.cpp
@@ -39,6 +40,9 @@ target_link_libraries(acfun PUBLIC OpenMP::OpenMP_CXX)
 set_source_files_properties(src/gemm_avx2.cpp   PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
 set_source_files_properties(src/gemm_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma")
 set_source_files_properties(src/gemm_int8_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma -mavx512vnni")
+# BF16 GEMM: AVX-512 BF16 的 vdpbf16_ps, 整数/bf16 点积累加到 f32, 带宽仅 float 之半;
+# 仅在检测到 avx512_bf16 时由基准 (bench_bf16) 调用, 否则回落 acfun_gemm。
+set_source_files_properties(src/gemm_bf16_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma -mavx512bf16")
 set_source_files_properties(src/winograd_avx2.cpp PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
 set_source_files_properties(src/winograd_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma")
 # Winograd F(4,3): 更大瓦片 (6x6 输入 / 4x4 输出 / 36 变换域元素), 与 F(2,3) 同构;
