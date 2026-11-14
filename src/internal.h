@@ -19,11 +19,27 @@ void acfun_gemm_ref_ld_b1(int M, int N, int K,
                           int ldA, int ldB, int ldC,
                           const float* A, const float* B, float* C);
 
+/* 带融合后处理 (epilogue) 的标量参考: C[i,j] = Σ_k A·B + bias[j] (+ 可选 ReLU)。
+ * 用作无 SIMD 主机 (backend==Scalar) 的 acfun_gemm_epi 落地点, 同时可作正确性基线。 */
+void acfun_gemm_ref_epi(int M, int N, int K,
+                        const float* A, const float* B, float* C,
+                        const float* bias, int act);
+
 /* SIMD 后端实现 (各自编译单元带对应 -march) */
 void acfun_gemm_avx2(int M, int N, int K,
                      const float* A, const float* B, float* C);
 void acfun_gemm_avx512(int M, int N, int K,
                        const float* A, const float* B, float* C);
+
+/* 带融合后处理 (epilogue fusion: bias + 可选 ReLU) 的 GEMM 后端, 见 acfun_gemm_epi。
+ * 仅当 bias 非 NULL 或 act!=0 时 (且为最后一个 KC 块) 才在写回时叠加后处理, 故
+ * bias=NULL/act=0 时与无融合后端逐指令一致、零开销。 */
+void acfun_gemm_avx2_epi(int M, int N, int K,
+                         const float* A, const float* B, float* C,
+                         const float* bias, int act);
+void acfun_gemm_avx512_epi(int M, int N, int K,
+                           const float* A, const float* B, float* C,
+                           const float* bias, int act);
 
 /* AVX-512 BF16 后端 (vdpbf16ps, 编译单元带 -mavx512f -mfma -mavx512bf16):
  * float 输入/输出, 内部转 bf16 计算、f32 累加; 带宽仅 float 之半, 对标 MNN bf16 低精度路径。 */
@@ -73,6 +89,9 @@ void acfun_conv2d_dw_scalar(const float* input, int N, int H, int W, int C,
 /* 调度器下发的期望线程数 (1 = 串行); 后端据此选择串行或 omp parallel num_threads */
 void acfun_set_num_threads_runtime(int n);
 int  acfun_get_num_threads_runtime(void);
+
+/* 线程数选择 (工作感知 + cgroup 感知), 供 acfun_gemm / acfun_gemm_epi 共用 */
+int  acfun_pick_threads(int M, int N, int K);
 
 /* ---- INT8 量化 GEMM (对标 MNN int8 推理): A=uint8, B=int8, C=int32 累加 ----
  * 由 gemm_int8.cpp 调度器按 CPU 特性派发到 VNNI 后端或标量参考。 */

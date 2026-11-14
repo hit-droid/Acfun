@@ -16,9 +16,15 @@
  *   所有 m0 复用同一份只读 B 面板。于是 A 与 B 各仅从内存流一次 (总量 M·K + K·N)，
  *   彻底消除冗余流量 → 多核随物理核数近线性扩展。
  *
+ * 三、融合后处理 (epilogue fusion, 对标 MNN "post-GEMM fusion")
+ *   bias 为逐输出列 (通道) 向量, 长度 N; ReLU 为逐元素激活。在微内核写回 C 的同一步
+ *   里就地叠加 bias[j] 并施加 ReLU, 仅在最后一个 KC 块 (归约完成) 进行——从而省去卷积/
+ *   FC 层在 GEMM 之后再做一遍 "读 C → +bias → 可选 ReLU → 写 C" 的全张量扫描, 消除一次
+ *   完整内存往返。bias=NULL 且 act=0 时本分支完全不进入, 与无融合路径逐指令一致、零开销。
+ *
  *   微内核循环序: N 外层 / M 内层。每个 16 列块载入一次 B 行 (复用 8 行块)，
  *   累加器跨整个 KC 累加，β=0/β=1 跨 KC 块累加保证大矩阵正确性。
- *   行/列尾部余数 (M%MR、N%NR) 交给标量参考 (β=0/β=1 两套)，保证正确。
+ *   行/列尾部余数 (M%MR、N%NR) 交给标量参考 (β=0/β=1 两套) 补齐, 后处理同样在末块叠加。
  *
  * 编译单元需带 -mavx512f -mfma。 */
 #include "internal.h"
@@ -56,16 +62,37 @@ static void auto_blocks(int MC, int* KC, int* NC) {
 static const int MR = 16;
 static const int NR = 16;
 
+/* 融合后处理 (epilogue): 在一个 C 矩形 [r0,r1)×[c0,c1) 上就地叠 bias[j] + 可选 ReLU。
+ * 仅末 KC 块调用, 且仅当确有后处理需求 (bias 非空或 act) 才进入。bias 按全局列索引 j 寻址。 */
+static inline void apply_epi(float* C, int r0, int r1, int c0, int c1, int N,
+                             const float* bias, int act) {
+    if (!bias && !act) return;
+    for (int i = r0; i < r1; ++i) {
+        float* p = C + (size_t)i * N + c0;
+        for (int j = c0; j < c1; ++j) {
+            float v = p[j - c0];
+            if (bias) v += bias[j];
+            if (act && v < 0.0f) v = 0.0f;
+            p[j - c0] = v;
+        }
+    }
+}
+
 /* 微内核: 仅处理完整 MR×NR 块。Ap/Bp 为该 (m0,n0) 瓦片已全 K 打包的面板,
  * 索引 [k*MC + i] / [k*NC + j]；k 从 0 起。Cbase 为瓦片在 C 中的原点 (m0*ldc+n0)。
  *
  * 两阶段软件流水 (k 步长 2) + 双面板预取: 每轮同时取 k 与 k+1 的 B 向量, 各做 16 路 FMA,
  * 指令级并行度翻倍以掩盖 FMA 与广播 loads 的延迟; 同时对 A/B 下一 k 的缓存行做 T0 预取,
- * 使面板数据在读前落入 L1。实测 (Zen4/EPYC AVX-512F+FMA) 较单 k 版本单核吞吐再提升一档。 */
+ * 使面板数据在读前落入 L1。实测 (Zen4/EPYC AVX-512F+FMA) 较单 k 版本单核吞吐再提升一档。
+ *
+ * 末 KC 块 (last!=0) 写回时就地融合后处理: 每个 16 列块载入 bias[n0+nn..+15] 一次,
+ * 16 路累加器各 +bias 后 (可选) 取 max(0,·); 非末块恒不叠加 (bias 仅在归约完成后加一次)。 */
 static inline void kernel(const float* Ap, const float* Bp, float* Cbase, int ldc,
-                          int mc, int nc, int kc, int MC, int NC, int beta) {
+                          int mc, int nc, int kc, int MC, int NC, int beta,
+                          const float* bias, int n0, int act, int last) {
     int mrR = mc - (mc & (MR - 1));
     int nrR = nc - (nc & (NR - 1));
+    __m512 z = _mm512_setzero_ps();
     for (int nn = 0; nn < nrR; nn += NR) {          /* N 外层: B 块被完整复用 */
         for (int mm = 0; mm < mrR; mm += MR) {      /* M 内层: 16 行 */
             __m512 c[MR];                           /* MR 行 × NR 列 累加器 */
@@ -98,32 +125,51 @@ static inline void kernel(const float* Ap, const float* Bp, float* Cbase, int ld
                     c[i] = _mm512_fmadd_ps(a, b, c[i]);
                 }
             }
+            /* ---- 融合后处理: 仅末 KC 块在归约完成后叠加 bias + 可选 ReLU ---- */
+            if (last) {
+                __m512 bvec = bias ? _mm512_loadu_ps(bias + n0 + nn) : z;
+                for (int i = 0; i < MR; ++i) {
+                    if (bias) c[i] = _mm512_add_ps(c[i], bvec);
+                    if (act)   c[i] = _mm512_max_ps(c[i], z);
+                }
+            }
             for (int i = 0; i < MR; ++i) _mm512_storeu_ps(cp + (size_t)i * ldc, c[i]);
         }
     }
 }
 
 /* 行/列尾部余数: 用带 ld 的标量参考补齐, 与微内核区域互不重叠、各跨 KC 块累加。
- * 注意 A/B 需按当前 KC 面板起点 k0 偏移 (KC 参数实为面板宽度 kc)。 */
+ * 末 KC 块 (last) 时, 在标量写完的尾区矩形上叠加 bias + 可选 ReLU (与微内核同口径)。
+ * 注意 A/B 需按当前 KC 面板起点 k0 偏移 (KC 参数实为面板宽度 kc)。bias 按全局列索引寻址。 */
 static inline void tile_tails(int m0, int n0, int M, int N, int K,
                               const float* A, const float* B, float* C,
-                              int MC, int NC, int kc, int mc, int nc, int k0, int beta) {
+                              int MC, int NC, int kc, int mc, int nc, int k0, int beta,
+                              const float* bias, int act, int last) {
     const int lda = K, ldb = N, ldc = N;
     int mrR = mc - (mc & (MR - 1));
     int nrR = nc - (nc & (NR - 1));
     auto f = beta ? acfun_gemm_ref_ld_b1 : acfun_gemm_ref_ld;
-    if (mc > mrR)
+    if (mc > mrR) {
+        int r0 = m0 + mrR, r1 = m0 + mc, c0 = n0, c1 = n0 + nrR;
         f(mc - mrR, nrR, kc, lda, ldb, ldc,
           A + ((size_t)(m0 + mrR)) * lda + k0, B + (size_t)k0 * ldb + n0,
-          C + ((size_t)(m0 + mrR)) * ldc + n0);
-    if (nc > nrR)
+          C + ((size_t)r0) * ldc + c0);
+        if (last) apply_epi(C, r0, r1, c0, c1, N, bias, act);
+    }
+    if (nc > nrR) {
+        int r0 = m0, r1 = m0 + mrR, c0 = n0 + nrR, c1 = n0 + nc;
         f(mrR, nc - nrR, kc, lda, ldb, ldc,
           A + (size_t)m0 * lda + k0, B + (size_t)k0 * ldb + n0 + nrR,
-          C + (size_t)m0 * ldc + (n0 + nrR));
-    if (mc > mrR && nc > nrR)
+          C + ((size_t)r0) * ldc + c0);
+        if (last) apply_epi(C, r0, r1, c0, c1, N, bias, act);
+    }
+    if (mc > mrR && nc > nrR) {
+        int r0 = m0 + mrR, r1 = m0 + mc, c0 = n0 + nrR, c1 = n0 + nc;
         f(mc - mrR, nc - nrR, kc, lda, ldb, ldc,
           A + ((size_t)(m0 + mrR)) * lda + k0, B + (size_t)k0 * ldb + n0 + nrR,
-          C + ((size_t)(m0 + mrR)) * ldc + (n0 + nrR));
+          C + ((size_t)r0) * ldc + c0);
+        if (last) apply_epi(C, r0, r1, c0, c1, N, bias, act);
+    }
 }
 
 /* 全 K 打包一个 m0 行块: A[m0:m0+mc, 0:K] -> [k*MC + i]。 */
@@ -146,15 +192,19 @@ static inline void packB_all(float* Bp, const float* B, int n0, int nc, int K, i
 static void gemm_tile_packed(int m0, int n0, int M, int N, int K,
                              const float* A, const float* B, float* C,
                              int MC, int NC, int KC,
-                             const float* Ap_mid, const float* Bp_nid) {
+                             const float* Ap_mid, const float* Bp_nid,
+                             const float* bias, int act) {
     int mc = std::min(MC, M - m0);
     int nc = std::min(NC, N - n0);
     for (int k0 = 0; k0 < K; k0 += KC) {
         int kc = std::min(KC, K - k0);
-        int beta = (k0 == 0) ? 0 : 1;   /* 同一瓦片跨 KC 块累加 */
+        int beta = (k0 == 0) ? 0 : 1;          /* 同一瓦片跨 KC 块累加 */
+        int last = (k0 + kc >= K) ? 1 : 0;      /* 末 KC 块才叠加后处理 */
         kernel(Ap_mid + (size_t)k0 * MC, Bp_nid + (size_t)k0 * NC,
-               C + (size_t)m0 * N + n0, N, mc, nc, kc, MC, NC, beta);
-        tile_tails(m0, n0, M, N, K, A, B, C, MC, NC, kc, mc, nc, k0, beta);
+               C + (size_t)m0 * N + n0, N, mc, nc, kc, MC, NC, beta,
+               bias, n0, act, last);
+        tile_tails(m0, n0, M, N, K, A, B, C, MC, NC, kc, mc, nc, k0, beta,
+                   bias, act, last);
     }
 }
 
@@ -162,12 +212,14 @@ static void gemm_tile_packed(int m0, int n0, int M, int N, int K,
  * B 面板按 (k0,n0) 打一次; 单线程算术强度拉满。 */
 static void gemm_mblock_stream(int m0, int M, int N, int K,
                                const float* A, const float* B, float* C,
-                               int MC, int NC, int KC, float* Ap, float* Bp) {
+                               int MC, int NC, int KC, float* Ap, float* Bp,
+                               const float* bias, int act) {
     int mc = std::min(MC, M - m0);
     const int lda = K, ldb = N, ldc = N;
     for (int k0 = 0; k0 < K; k0 += KC) {
         int kc = std::min(KC, K - k0);
         int beta = (k0 == 0) ? 0 : 1;
+        int last = (k0 + kc >= K) ? 1 : 0;
 
         /* 打包 A 面板: kk 外 / i 内 → Ap[kk*MC + i] 连续写入, 可被编译器向量化;
          * 若 i 外 / kk 内则跨 MC 步长散写, 既无法向量化又引发缓存行颠簸, 窄 N 时成为瓶颈。 */
@@ -181,14 +233,18 @@ static void gemm_mblock_stream(int m0, int M, int N, int K,
                 for (int j = 0; j < nc; ++j)
                     Bp[(size_t)kk * NC + j] = B[((size_t)(k0 + kk)) * ldb + n0 + j];
 
-            kernel(Ap, Bp, C + (size_t)m0 * ldc + n0, ldc, mc, nc, kc, MC, NC, beta);
-            tile_tails(m0, n0, M, N, K, A, B, C, MC, NC, kc, mc, nc, k0, beta);
+            kernel(Ap, Bp, C + (size_t)m0 * ldc + n0, ldc, mc, nc, kc, MC, NC, beta,
+                   bias, n0, act, last);
+            tile_tails(m0, n0, M, N, K, A, B, C, MC, NC, kc, mc, nc, k0, beta,
+                       bias, act, last);
         }
     }
 }
 
-void acfun_gemm_avx512(int M, int N, int K,
-                       const float* A, const float* B, float* C) {
+/* 公共核心: 含后处理融合的所有分块/线程逻辑; bias=NULL 且 act=0 时退化为无融合路径。 */
+static void gemm_avx512_core(int M, int N, int K,
+                             const float* A, const float* B, float* C,
+                             const float* bias, int act) {
     if (M <= 0 || N <= 0 || K <= 0) return;
     int KC = 256, NC = 128, MC = 256;
     int nt = acfun_get_num_threads_runtime();
@@ -228,7 +284,7 @@ void acfun_gemm_avx512(int M, int N, int K,
         float* Bp = (float*)malloc((size_t)KC * NC * sizeof(float));
         if (Ap && Bp) {
             for (int m0 = 0; m0 < M; m0 += MC)
-                gemm_mblock_stream(m0, M, N, K, A, B, C, MC, NC, KC, Ap, Bp);
+                gemm_mblock_stream(m0, M, N, K, A, B, C, MC, NC, KC, Ap, Bp, bias, act);
         }
         free(Ap); free(Bp);
         return;
@@ -274,8 +330,19 @@ void acfun_gemm_avx512(int M, int N, int K,
             int n0 = nid * NC;
             gemm_tile_packed(m0, n0, M, N, K, A, B, C, MC, NC, KC,
                              Apool + (size_t)mid * MC * K,
-                             Bpool + (size_t)nid * NC * K);
+                             Bpool + (size_t)nid * NC * K, bias, act);
         }
     }
     free(Apool); free(Bpool);
+}
+
+void acfun_gemm_avx512(int M, int N, int K,
+                       const float* A, const float* B, float* C) {
+    gemm_avx512_core(M, N, K, A, B, C, nullptr, 0);
+}
+
+void acfun_gemm_avx512_epi(int M, int N, int K,
+                           const float* A, const float* B, float* C,
+                           const float* bias, int act) {
+    gemm_avx512_core(M, N, K, A, B, C, bias, act);
 }

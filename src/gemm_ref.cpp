@@ -37,3 +37,27 @@ void acfun_gemm_ref_ld_b1(int M, int N, int K,
         }
     }
 }
+
+/* 带融合后处理 (epilogue) 的标量参考: C[i,j] = Σ_k A[i,k]·B[k,j] + bias[j],
+ * 若 act=1 再取 max(0,·)。后处理在 GEMM 归约完成后就地叠加, 与非融合路径严格等价。 */
+void acfun_gemm_ref_epi(int M, int N, int K,
+                        const float* A, const float* B, float* C,
+                        const float* bias, int act) {
+    for (int i = 0; i < M; ++i) {
+        const float* a = A + (size_t)i * K;
+        float* c = C + (size_t)i * N;
+        for (int j = 0; j < N; ++j) c[j] = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            float av = a[k];
+            if (av == 0.0f) continue;
+            const float* b = B + (size_t)k * N;
+            for (int j = 0; j < N; ++j) c[j] += av * b[j];
+        }
+        for (int j = 0; j < N; ++j) {
+            float v = c[j];
+            if (bias) v += bias[j];          /* 逐输出列 (通道) 偏置 */
+            if (act && v < 0.0f) v = 0.0f;   /* 可选 ReLU */
+            c[j] = v;
+        }
+    }
+}

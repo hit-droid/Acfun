@@ -18,12 +18,9 @@ void acfun_relu6(float* d, size_t len) {
 
 void acfun_fc(const float* input, int N, int Cin,
               const float* weight, const float* bias, int Cout, float* output) {
-    acfun_gemm(N, Cout, Cin, input, weight, output);
-    if (bias) {
-        for (int n = 0; n < N; ++n)
-            for (int c = 0; c < Cout; ++c)
-                output[(size_t)n * Cout + c] += bias[c];
-    }
+    /* 偏置经融合后处理 (epilogue) 在 GEMM 写回时就地叠加, 省去一遍独立全张量扫描。
+     * FC 层不在此叠 ReLU (ReLU 由模型执行器作为独立层施加), 故 act=0。 */
+    acfun_gemm_epi(N, Cout, Cin, input, weight, output, bias, 0);
 }
 
 void acfun_fc_relu(const float* input, int N, int Cin,
@@ -96,24 +93,11 @@ static void conv1x1_impl(const float* input, int N, int H, int W, int Cin,
         Aptr = Abuf;
     }
 
-    float* gemm_out = (float*)malloc(pixTotal * Cout * sizeof(float));
-    if (!gemm_out) { free(Abuf); return; }
-
-    /* 整批一次性 GEMM: A[pixTotal, Cin] * W[Cin, Cout] -> gemm_out[pixTotal, Cout] */
-    acfun_gemm((int)pixTotal, Cout, Cin, Aptr, weight, gemm_out);
-
-    /* 偏置 + (可选)ReLU 融合, 单次遍历写回 NHWC 输出 */
-    for (size_t p = 0; p < pixTotal; ++p) {
-        float* yo = output + p * Cout;
-        const float* go = gemm_out + p * Cout;
-        for (int c = 0; c < Cout; ++c) {
-            float v = go[c] + (bias ? bias[c] : 0.0f);
-            if (act == 1 && v < 0.0f) v = 0.0f;
-            yo[c] = v;
-        }
-    }
+    /* 整批一次性 GEMM + 融合后处理 (epilogue): A[pixTotal, Cin] * W[Cin, Cout] -> output[pixTotal, Cout]。
+     * NHWC 输出与 GEMM 左矩阵同形 (每像素一行、Cout 列), 故 GEMM 直接写回 output,
+     * 偏置与 (可选) ReLU 在 GEMM 写回时就地叠加, 省去独立的 gemm_out 缓冲与全张量扫描。 */
+    acfun_gemm_epi((int)pixTotal, Cout, Cin, Aptr, weight, output, bias, act);
     free(Abuf);
-    free(gemm_out);
 }
 
 /* 卷积内部实现: act=0 无激活, act=1 融合 ReLU (在输出写入时就地施加, 省去额外扫描)。
@@ -187,27 +171,18 @@ static void conv2d_impl(const float* input, int N, int H, int W, int Cin,
     if (OH <= 0 || OW <= 0) return;
     int ic = KH * KW * Cin;
     float* col = (float*)malloc((size_t)OH * OW * ic * sizeof(float));
-    float* gemm_out = (float*)malloc((size_t)OH * OW * Cout * sizeof(float));
-    if (!col || !gemm_out) { free(col); free(gemm_out); return; }
+    if (!col) return;
 
     for (int n = 0; n < N; ++n) {
         const float* x = input + (size_t)n * H * W * Cin;
         im2col(x, H, W, Cin, KH, KW, stride, pad, OH, OW, col);
-        /* col[OH*OW, ic] * weight[ic, Cout] -> gemm_out[OH*OW, Cout] */
-        acfun_gemm(OH * OW, Cout, ic, col, weight, gemm_out);
-        /* 偏置 + (可选)ReLU 在输出写入时融合, 单次遍历完成 */
+        /* col[OH*OW, ic] * weight[ic, Cout] -> yo[OH*OW, Cout]; 偏置与 (可选) ReLU
+         * 经融合后处理 (epilogue) 在 GEMM 写回时就地叠加, 直接落 NHWC 输出,
+         * 省去独立的 gemm_out 缓冲 + 一遍全张量扫描 (对标 MNN post-GEMM fusion)。 */
         float* yo = output + (size_t)n * OH * OW * Cout;
-        for (int r = 0; r < OH * OW; ++r) {
-            for (int c = 0; c < Cout; ++c) {
-                float v = gemm_out[(size_t)r * Cout + c];
-                if (bias) v += bias[c];
-                if (act == 1 && v < 0.0f) v = 0.0f;
-                yo[(size_t)r * Cout + c] = v;
-            }
-        }
+        acfun_gemm_epi(OH * OW, Cout, ic, col, weight, yo, bias, act);
     }
     free(col);
-    free(gemm_out);
 }
 
 void acfun_conv2d(const float* input, int N, int H, int W, int Cin,

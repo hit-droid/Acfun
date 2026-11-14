@@ -838,6 +838,87 @@ static void bench_bf16() {
     printf("  * BF16 带宽仅 float 之半、f32 累加; 与 MNN 的 bf16/int8 低精度路径同构\n");
 }
 
+/* ---------- 1c) GEMM 融合后处理 (epilogue) 正确性 ----------
+ * 以 "acfun_gemm + 独立偏置/ReLU 遍" 作参考, 与融合版 acfun_gemm_epi 严格比对。
+ * 覆盖非整除边界尺寸、有无偏置、act=0/1, 验证 bias 仅在归约完成后叠加一次。 */
+static int correctness_epi() {
+    printf("\n=== GEMM 融合后处理 (epilogue) 正确性 (acfun_gemm_epi vs 非融合参考) ===\n");
+    int fails = 0;
+    struct S { int M, N, K; bool has_bias; int act; } cfgs[] = {
+        {64,64,64,true,1}, {100,100,100,true,1}, {255,255,255,true,0},
+        {512,17,64,true,1}, {63,512,33,false,1}, {1023,1023,1023,true,1},
+        {300,16,144,true,1}, {256,256,256,false,0},
+    };
+    for (auto& c : cfgs) {
+        int M=c.M, N=c.N, K=c.K;
+        std::vector<float> A((size_t)M*K), B((size_t)K*N), bias(c.has_bias?(size_t)N:0, 0.1f);
+        std::vector<float> Cref((size_t)M*N), Csim((size_t)M*N);
+        rand_fill(A.data(), A.size());
+        rand_fill(B.data(), B.size());
+        /* 参考: GEMM + 独立偏置/ReLU 遍 */
+        acfun_gemm(M, N, K, A.data(), B.data(), Cref.data());
+        for (int i = 0; i < M; ++i) for (int j = 0; j < N; ++j) {
+            float v = Cref[(size_t)i*N+j];
+            if (c.has_bias) v += bias[j];
+            if (c.act && v < 0.0f) v = 0.0f;
+            Cref[(size_t)i*N+j] = v;
+        }
+        acfun_gemm_epi(M, N, K, A.data(), B.data(), Csim.data(),
+                       c.has_bias ? bias.data() : nullptr, c.act);
+        float maxd = 0.0f;
+        for (size_t i = 0; i < Cref.size(); ++i)
+            maxd = std::max(maxd, std::fabs(Cref[i] - Csim[i]));
+        bool ok = maxd < 1e-2f;
+        if (!ok) fails++;
+        const char* bs = c.has_bias ? "bias" : "no-bias";
+        const char* as = c.act ? "relu" : "no-act";
+        printf("  M=%d N=%d K=%d %s %s  max|Δ|=%9.3e  %s\n", M, N, K, bs, as, maxd, ok?"OK":"FAIL");
+    }
+    printf("  %s\n", fails==0 ? "融合后处理全部通过" : "融合后处理存在失败");
+    return fails;
+}
+
+/* ---------- 2c) GEMM 融合后处理 (epilogue) 吞吐 ----------
+ * 量化 "融合后处理" 消除的独立全张量扫描收益: 同等 (M,N,K) 下,
+ * 非融合 (GEMM + 独立偏置/ReLU 遍) vs 融合 (acfun_gemm_epi)。 */
+static void bench_epi() {
+    printf("\n=== GEMM 融合后处理 (epilogue) 吞吐对比 ===\n");
+    struct S { int M, N, K; } cfgs[] = {
+        {1024,1024,1024}, {2048,2048,2048}, {512,512,512},
+        {112*112,16,144}, {64*64,32,288}, {256,256,256},
+    };
+    printf("%-16s %14s %14s %12s\n", "M×N×K", "非融合(ms)", "融合epi(ms)", "加速");
+    for (auto& c : cfgs) {
+        int M=c.M, N=c.N, K=c.K;
+        std::vector<float> A((size_t)M*K), B((size_t)K*N), bias((size_t)N, 0.1f);
+        std::vector<float> C1((size_t)M*N), C2((size_t)M*N);
+        rand_fill(A.data(), A.size()); rand_fill(B.data(), B.size());
+        int reps = (M*N*K > (1<<28)) ? 5 : 20;
+        /* 非融合参考 */
+        double t0 = now();
+        for (int r = 0; r < reps; ++r) {
+            acfun_gemm(M, N, K, A.data(), B.data(), C1.data());
+            for (int i = 0; i < M; ++i) for (int j = 0; j < N; ++j) {
+                float v = C1[(size_t)i*N+j] + bias[j];
+                if (v < 0.0f) v = 0.0f;
+                C1[(size_t)i*N+j] = v;
+            }
+        }
+        double tUnfused = (now() - t0) / reps;
+        /* 融合 */
+        t0 = now();
+        for (int r = 0; r < reps; ++r)
+            acfun_gemm_epi(M, N, K, A.data(), B.data(), C2.data(), bias.data(), 1);
+        double tEpi = (now() - t0) / reps;
+        /* 一致性门禁 */
+        float maxd = 0; for (size_t i = 0; i < C1.size(); ++i) maxd = std::max(maxd, std::fabs(C1[i]-C2[i]));
+        char label[32];
+        snprintf(label, sizeof(label), "%dx%dx%d", M, N, K);
+        printf("%-16s %14.4f %14.4f %11.1fx  max|Δ|=%9.3e %s\n",
+               label, tUnfused*1e3, tEpi*1e3, tUnfused/tEpi, maxd, maxd<1e-2f?"OK":"FAIL");
+    }
+}
+
 int main(int argc, char** argv) {
     bool do_tune = false;
     for (int i = 1; i < argc; ++i) if (std::strcmp(argv[i], "--tune") == 0) do_tune = true;
@@ -849,11 +930,13 @@ int main(int argc, char** argv) {
     printf(">>> GEMM 调参状态: %s\n", acfun_tune_status());
     int fails = correctness();
     fails += correctness_int8();
+    fails += correctness_epi();
     bench_gemm();
     bench_gemm_scale();
     bench_conv();
     bench_winograd();
     bench_winograd43();
+    bench_epi();
     const char* mp = (argc > 1) ? argv[1] : "model.acfun";
     bench_e2e(mp);
     bench_fusion(mp);

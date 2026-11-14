@@ -33,6 +33,17 @@ const char* acfun_tune_status(void);
 void acfun_gemm(int M, int N, int K,
                 const float* A, const float* B, float* C);
 
+/* ---- GEMM 带融合后处理 (epilogue fusion), 对标 MNN 的 "post-GEMM fusion" ----
+ * 在 GEMM 写回 C 的同一个最内层循环里就地叠加偏置并施加激活, 省去卷积/全连接层
+ * 在 GEMM 之后再做一遍 "读 C -> +bias -> 可选 ReLU -> 写 C" 的全张量扫描 (约占一次
+ * 完整内存往返)。这正是 MNN 在卷积/FC 层吃吞吐的关键手段之一。
+ *   C[i,j] = (Σ_k A[i,k]·B[k,j] + bias[j]) 后, 若 act=1 再取 max(0,·)。
+ * bias 长度 N (逐输出列/逐通道), 可为 NULL (不叠偏置); act 取 0/1。
+ * 数值上与非融合路径严格等价 (bias 仅在 K 维归约完成后叠加一次)。 */
+void acfun_gemm_epi(int M, int N, int K,
+                    const float* A, const float* B, float* C,
+                    const float* bias, int act);
+
 /* ---- BF16 GEMM (AVX-512 BF16, vdpbf16_ps): 对标 MNN 低精度推理路径 ----
  * 接口与 acfun_gemm 一致 (float 输入/输出), 内部将 A/B 转为 bf16 计算、以 f32 累加,
  * 带宽需求仅 float 之半, 推理逐层输出与 float 近似等价。仅在运行时检测到 avx512_bf16

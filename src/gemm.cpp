@@ -89,7 +89,19 @@ const char* acfun_backend_name(void) {
 
 void acfun_gemm(int M, int N, int K,
                 const float* A, const float* B, float* C) {
-    /* 线程数: 显式设置优先, 否则 ACFUN_THREADS 环境变量, 否则物理核数 */
+    int nt = acfun_pick_threads(M, N, K);
+    if (nt > 1) omp_set_num_threads(nt);
+    acfun_set_num_threads_runtime(nt);
+    int b = detect_backend();
+    if (b == 1)      acfun_gemm_avx512(M, N, K, A, B, C);
+    else if (b == 2) acfun_gemm_avx2(M, N, K, A, B, C);
+    else             acfun_gemm_ref(M, N, K, A, B, C);
+}
+
+/* 线程数选择 (工作感知 + cgroup 感知), 供 acfun_gemm / acfun_gemm_epi 共用:
+ * 显式设置优先, 否则 ACFUN_THREADS 环境变量, 否则物理核数; 再压到 cgroup 配额内,
+ * 最后按总 FLOP 设每线程下限 (~64M) 收缩, 极小 GEMM 直接回落串行。 */
+int acfun_pick_threads(int M, int N, int K) {
     int nt = 0;
     if (g_threads > 0) {
         nt = g_threads;
@@ -120,10 +132,17 @@ void acfun_gemm(int M, int N, int K,
         if (cap < 1) cap = 1;
         if ((long long)nt > cap) nt = (int)cap;
     }
+    return nt;
+}
+
+void acfun_gemm_epi(int M, int N, int K,
+                    const float* A, const float* B, float* C,
+                    const float* bias, int act) {
+    int nt = acfun_pick_threads(M, N, K);
     if (nt > 1) omp_set_num_threads(nt);
     acfun_set_num_threads_runtime(nt);
     int b = detect_backend();
-    if (b == 1)      acfun_gemm_avx512(M, N, K, A, B, C);
-    else if (b == 2) acfun_gemm_avx2(M, N, K, A, B, C);
-    else             acfun_gemm_ref(M, N, K, A, B, C);
+    if (b == 1)      acfun_gemm_avx512_epi(M, N, K, A, B, C, bias, act);
+    else if (b == 2) acfun_gemm_avx2_epi(M, N, K, A, B, C, bias, act);
+    else             acfun_gemm_ref_epi(M, N, K, A, B, C, bias, act);
 }

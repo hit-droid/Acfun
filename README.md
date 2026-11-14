@@ -512,6 +512,45 @@ f32 累加：
 
 ---
 
+### 本轮新增：Post-GEMM Epilogue 融合（偏置 + ReLU 折叠进 GEMM 写回，对标 MNN 存储融合）
+
+继续围绕「推理速度」补强——这次不是新算子，而是把**已有的全连接 / 卷积输出阶段**里那一遍
+**独立的「整体偏置加法 + ReLU」全张量读写**彻底消掉。这是 MNN 在存储阶段做融合的标准手法。
+
+**问题**：FC / Conv 在 GEMM 算完后，原来还要对整块输出 `C[M][N]` 再走一遍
+`for (j) { c[j] += bias[j]; if (act) c[j] = max(c[j], 0); }`——一次完整的读改写，且为了这遍融合，
+im2col 卷积 / 1×1 卷积此前还额外分配了一块中间 `gemm_out` 缓冲（`A·B` 写入 `gemm_out`，再叠加
+偏置/ReLU 写回真正的 `output`）。小 N（输出通道少）卷积的 GEMM 本身很廉价（见下方实测），
+这一遍独立扫描的访存开销占比反而可观。
+
+**做法**：新增公共 API `acfun_gemm_epi(M,N,K,A,B,C,bias,act)`，把偏置加法与 ReLU **折叠进 GEMM
+微内核的末尾写回**：
+
+- **仅在最后一个 KC 面板**做 epilogue——GEMM 对 `K` 方向是多面板累加，偏置必须在整行累加**完成后**
+  才能加（否则每面板各加一遍 → 数值错误）。实现上令 `last = (k0+kc >= K)`，仅当 `last` 时对该 16 列块
+  施加 `c += bias` 与 `c = max(c, 0)`，正确性与「GEMM 后单独扫一遍」严格等价；
+- **AVX-512 / AVX2 双后端**均落地该融合：微内核在 FMA 累加后、store 前于寄存器里完成
+  `vadd(bias)` + `vmax(zero)`，省掉整块输出的二次访存；`last` 之外的面板 epilogue 提前返回
+  （`!bias && !act` 时零开销）；
+- **层侧接线**：`acfun_fc` 直接 `acfun_gemm_epi(..., bias, 0)`（去掉原独立偏置循环）；`conv1x1_impl`
+  与 im2col 卷积路径**彻底删掉 `gemm_out` 中间缓冲**，直接 `acfun_gemm_epi(..., output, bias, act)`
+  一写到位——既少一次全张量读写，又省一块 `M·N` 大小的内存分配与峰值占用；
+- 标量参考实现 `acfun_gemm_ref_epi` 同步补齐，作为正确性基线与 Scalar 后端落点。
+
+> **实测（沙箱 AVX-512 Zen5，融合 vs 未融合，benchmark 见 `benchmark_result.txt` 的 epilogue 段）**：
+> - **正确性（最重要且可复现）**：`acfun_gemm_epi` vs 「`acfun_gemm` + 独立偏置/ReLU 参考」跨 8 组尺寸
+>   （含有/无偏置、有/无激活、非整除边界）`max|Δ|=0`，数学严格等价，零回归；
+> - **确定性结构收益**：FC / 1×1 / im2col 卷积路径删去了 `gemm_out` 中间缓冲（少一次 `M·N` 大小的内存
+>   分配与峰值占用）与一遍独立的整体扫描——这是不会随负载波动的实打实收益，尤其利好显存受限部署；
+> - **墙钟加速（诚实口径）**：本沙箱为共享 cgroup，GEMM 计时在 ±20% 带内波动。被消除的偏置+ReLU 整块
+>   二次访存（如 1024³ 输出 4MB，约 0.8 ms）相对 ~9 ms 的 GEMM 本体较小，故多次运行测得融合比
+>   **~1.0–1.1×**（个别运行噪声下曾达 ~1.6×，但不稳定）。在裸机 / 带宽更宽裕、或窄 N 卷积（GEMM 更廉价、
+>   后处理占比更高）的场景下，这遍消除的收益会更清楚地体现。
+> - 结论：epilogue 融合不退化、零回归，并以「去中间缓冲 + 去独立扫描」给出确定性的内存与代码路径收益；
+>   墙钟提速在噪声主机上被 GEMM 本体掩盖，属预期内，并非正确性/架构问题。
+
+---
+
 ## 与 MNN 的对比（实事求是）
 
 MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极高吞吐。Acfun 已补齐多项关键能力：
@@ -536,6 +575,12 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   **BF16 GEMM（AVX-512 `vdpbf16ps` 微内核，bf16 计算/f32 累加、交错双面板打包 + KC 分块 + 二维瓦片并行；
   全尺寸较 float GEMM 稳定 1.5–4.9×、4 线程达 ~1 TFLOPS、`max|Δ|/范数<2.5e-3` 全部 OK，与 MNN
   bf16/int8 低精度路径同级）**。
+- ✅ **Post-GEMM Epilogue 融合（偏置 + ReLU 折叠进 GEMM 末尾写回，对标 MNN 存储融合）**：新增公共
+  API `acfun_gemm_epi`，AVX-512 / AVX2 双后端在微内核最后 KC 面板于寄存器内完成 `vadd(bias)` +
+  `vmax(zero)`，消除整块输出的二次读改写；FC / 1×1 / im2col 卷积路径删去独立偏置循环与 `gemm_out`
+  中间缓冲、一写到位。跨 8 组尺寸（含非整除边界）`max|Δ|=0` 严格等价、零回归；FC / 卷积删去 `gemm_out`
+  中间缓冲与独立扫描，给出确定性的内存/代码路径收益（共享 cgroup 主机上墙钟加速被 GEMM 本体噪声
+  掩盖，约 ~1.0–1.1×，裸机/窄 N 卷积场景收益更明显）。
 - ✅ 单线程效率：AVX-512 参考主机实测 **~75–90%** 单核 FMA 峰值（EPYC 9754 Zen4c 真实峰值
   ~83 GFLOPS/核），已进入 MNN 同量级单线程效率区间；当前 AVX2 开发沙箱单线程 GEMM ~32 GFLOPS。
 - ✅ **GEMM 多核扩展修复（v0.9.1）**：`acfun_gemm` 默认线程数改取 `acfun_effective_cores()`
@@ -558,10 +603,10 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
 
 ```
 include/acfun/acfun.h   公共 C API
-src/gemm.cpp            GEMM 调度器（运行时派发 + 线程/物理核控制）
-src/gemm_ref.cpp        标量参考实现（β=0 / β=1，尾部余数）
-src/gemm_avx2.cpp       AVX2+FMA 后端（6×16 微内核，最优 A 打包 + 三级分块）
-src/gemm_avx512.cpp     AVX-512F+FMA 后端（16×16 微内核，最优 A 打包 + 三级分块）
+src/gemm.cpp            GEMM 调度器（运行时派发 + 线程/物理核控制 + `acfun_gemm_epi` 派发）
+src/gemm_ref.cpp        标量参考实现（β=0 / β=1，尾部余数；含 epilogue 融合参考 `acfun_gemm_ref_epi`）
+src/gemm_avx2.cpp       AVX2+FMA 后端（6×16 微内核，最优 A 打包 + 三级分块；含 epilogue 融合 `acfun_gemm_avx2_epi`）
+src/gemm_avx512.cpp     AVX-512F+FMA 后端（16×16 微内核，最优 A 打包 + 三级分块；含 epilogue 融合 `acfun_gemm_avx512_epi`）
 src/gemm_int8.cpp        INT8 GEMM 调度/派发（运行时按 VNNI 能力选择后端）
 src/gemm_int8_avx512.cpp INT8 GEMM AVX-512 VNNI 后端（vpdpbusd 微内核，-mavx512vnni 独立单元）
 src/gemm_bf16_avx512.cpp BF16 GEMM AVX-512 后端（vdpbf16ps 微内核，交错双面板打包 + KC 分块，-mavx512f -mfma -mavx512bf16 独立单元）
