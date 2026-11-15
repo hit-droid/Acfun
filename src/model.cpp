@@ -32,6 +32,7 @@ struct Layer {
     const float* w;
     const float* b;
     int act;            /* 0=无激活 1=融合 ReLU (仅 Conv/FC 使用) */
+    int post_relu;      /* 0=池化后无激活 1=池化后融合 ReLU (仅 MaxPool 使用) */
 };
 
 struct AcfunModel {
@@ -206,19 +207,40 @@ AcfunModel* acfun_model_load(const char* path) {
             F.w = L.w; F.b = L.b; F.act = 0;
             int Cout = (L.type == 2) ? L.p[0] : L.p[2];
             int j = i + 1;
-            bool sawReLU = false;
-            if (j < num && raw[j].type == 3) { sawReLU = true; j++; }
+            int reluIdx = -1;
+            if (j < num && raw[j].type == 3) { reluIdx = j; j++; }
             if (j < num && raw[j].type == 6 && raw[j].p[0] == Cout) {
                 fold_bn_into(F, raw[j], Cout, L.wn, m);   /* BN 折叠进权重 */
                 consumed[j] = 1;
             }
-            if (sawReLU) { F.act = 1; consumed[i + 1] = 1; }  /* ReLU 融合 (无论 BN 是否折叠) */
+            /* ReLU 融合策略: 若紧随 ReLU 之后 (经可能的 BN 折叠后) 是 MaxPool, 则该 ReLU
+             * 冗余 —— 逐元素 max 与 ReLU 可交换, Pool(ReLU(x)) ≡ Pool(x), 故直接丢弃 ReLU、
+             * 卷积不施加激活, 由后续 MaxPool 对原始卷积输出取最大。这既消去卷积写回的激活
+             * 扫描、又避免独立的 ReLU 遍, 零数值风险; 否则维持「卷积 + 融合 ReLU」原行为。 */
+            if (reluIdx >= 0) {
+                if (j < num && raw[j].type == 4) {
+                    consumed[reluIdx] = 1;   /* 丢弃冗余 ReLU */
+                    F.act = 0;
+                } else {
+                    F.act = 1; consumed[reluIdx] = 1;  /* ReLU 融合进卷积 (原行为) */
+                }
+            }
             out.push_back(F);
         } else if (L.type == 3) {                 /* 独立 ReLU (未被前层吸收) */
+            /* 若紧邻其后为 MaxPool, 该 ReLU 冗余 (Pool(ReLU(x)) ≡ Pool(x)), 直接丢弃,
+             * 由 MaxPool 对原始输入取最大, 省去独立激活遍 (零数值风险)。 */
+            if (i + 1 < num && raw[i + 1].type == 4) { consumed[i] = 1; continue; }
             Layer F; std::memset(&F, 0, sizeof(F)); F.type = 3; out.push_back(F);
         } else if (L.type == 6) {                 /* 独立 BN (通道数不匹配等) */
             Layer F; std::memset(&F, 0, sizeof(F)); F.type = 6; F.p[0]=L.p[0]; F.w=L.w; out.push_back(F);
-        } else {                                  /* MaxPool / Softmax */
+        } else if (L.type == 4) {                 /* MaxPool */
+            Layer F; std::memset(&F, 0, sizeof(F)); F.type = 4;
+            std::memcpy(F.p, L.p, sizeof(L.p)); F.w = L.w; F.b = L.b; F.post_relu = 0;
+            /* MaxPool→ReLU 融合: 紧随其后的独立 ReLU 折叠进池化 (就地 max(x,0)), 省去
+             * 独立激活遍, 与「先 Pool 再 ReLU」数学等价 (零数值风险)。 */
+            if (i + 1 < num && raw[i + 1].type == 3) { F.post_relu = 1; consumed[i + 1] = 1; }
+            out.push_back(F);
+        } else {                                  /* Softmax */
             Layer F; std::memset(&F, 0, sizeof(F)); F.type=L.type; std::memcpy(F.p, L.p, sizeof(L.p));
             F.w=L.w; F.b=L.b; out.push_back(F);
         }
@@ -304,7 +326,8 @@ int acfun_model_infer(AcfunModel* m, const float* input, float* output) {
                 nC=C; ncap=(size_t)N*nH*nW*nC;
                 int dst = 1 - m->cur;
                 float* outb = ensure_buf(m, dst, ncap);
-                acfun_maxpool(cur,N,H,W,C,pool,st,pd,outb);
+                if (L->post_relu) acfun_maxpool_relu(cur,N,H,W,C,pool,st,pd,outb);
+                else             acfun_maxpool(cur,N,H,W,C,pool,st,pd,outb);
                 m->cur=dst; cur=outb;
                 break;
             }

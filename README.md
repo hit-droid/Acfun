@@ -567,6 +567,9 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   逼近 float 卷积本体 0.6–1.2×、`max|Δ|/范数<0.6%` 全部 OK）**、
   **深度卷积（逐通道）AVX-512 跨通道 16 路向量化（`acfun_conv2d_dw`，较朴素直乘 ~6–36×、
   `max|Δ|<1e-6`，padding 掩码归零、尾通道掩码 load/store）**、
+  **最大池化通道向量化（AVX-512 16 路 / AVX2 8 路 `vmaxps` 归约，运行时派发，标量版作基线/兜底，
+  宽通道较朴素标量 ~4–16×、`max|Δ|=0`）**、**池化图优化（ReLU→MaxPool 冗余消除 + MaxPool→ReLU
+  融合，零数值风险，对标 MNN 的层/图融合）**、
   **分组卷积（通用 groups，含 BN 折叠组感知；`groups==Cin==Cout` 自动路由深度卷积，否则各组复用
   1×1/Winograd/im2col 子路径，较朴素分组参考 ~1.7–32×、`max|Δ|<4e-6`，模型 type 7 已支持）**、
   **GEMM 自动调参（autotuning：运行时按硬件实测最优 KC/NC 分块 + 多尺寸无回归门控 + 本地缓存复用 +
@@ -591,9 +594,10 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
 - ✅ **INT8 GEMM 多核调度对齐（v1.1.0）**：INT8 GEMM 的二维瓦片并行 / 打包循环由 `schedule(dynamic,1)` 改为
   `schedule(static)`，与 float GEMM（v0.9.1 据此修复 8T+ 吞吐反降）同构——消除 dynamic 中央任务队列锁竞争，
   在裸机多核（带宽充裕）与受限容器（配额封顶）下均按连续瓦片带近线性扩展，单线程路径零改动（无回归）。
-- 🚧 差距与路线：移动端 **ARM NEON** 后端、更细的图优化（算子重排/常量折叠）、多尺寸 / 非 1 stride 的
-  Winograd 变体（F(4,3) 已在 3×3 专用路径启用，可向更宽 stride / 非方阵推广）、INT8 微内核 ILP 与
-  更大 KC 的进一步压榨（当前 INT8 大矩阵受内存带宽饱和限制）。
+- 🚧 差距与路线：移动端 **ARM NEON** 后端（池化 / 卷积）、更细的图优化（算子重排 / 常量折叠 /
+  **Conv→Pool 跨层带流式融合以彻底消去中间张量**）、多尺寸 / 非 1 stride 的 Winograd 变体
+  （F(4,3) 已在 3×3 专用路径启用，可向更宽 stride / 非方阵推广）、INT8 微内核 ILP 与更大 KC 的
+  进一步压榨（当前 INT8 大矩阵受内存带宽饱和限制）。
 
 下一步以在 ARM 端复现对标结果、深化图优化、进一步逼近 MNN 端到端吞吐为主。
 
@@ -619,7 +623,9 @@ src/winograd_int8.cpp   INT8 Winograd 3×3 整数域快速卷积（AVX-512 `vpma
 src/layers.cpp          卷积（含融合 ReLU / Winograd / 深度&分组 自动路由）、全连接、FC+ReLU 融合、激活、池化、Softmax、BN
 src/dw.cpp              深度卷积（逐通道）标量参考 + AVX-512 派发
 src/dw_avx512.cpp       深度卷积 AVX-512 跨通道 16 路向量化内核（-mavx512f -mfma 独立单元）
-src/model.cpp           二进制模型加载（含 BN 折叠/ReLU 融合、type 7 分组卷积）与顺序执行器
+src/maxpool_avx2.cpp    最大池化 AVX2 通道向量化内核（-mavx2 -mfma 独立单元）
+src/maxpool_avx512.cpp  最大池化 AVX-512 通道向量化内核（-mavx512f -mfma 独立单元）
+src/model.cpp           二进制模型加载（含 BN 折叠/ReLU 融合/池化图优化、type 7 分组卷积）与顺序执行器
 src/benchmark.cpp       正确性 + GEMM/卷积/端到端/融合/FC+ReLU 融合 基准（含多线程扩展曲线）
 tools/gen_model.py      测试模型生成器
 tools/test_bf16.cpp       BF16 GEMM 独立验证（正确性 + 吞吐 vs float，独立编译运行）

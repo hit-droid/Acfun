@@ -662,6 +662,76 @@ static void bench_fc_relu_fused() {
     printf("  %s\n", fails==0 ? "FC+ReLU 融合全部通过" : "FC+ReLU 融合存在失败");
 }
 
+/* ---------- 6b) 最大池化: 通道向量化 (AVX-512/AVX2) + 图优化 ----------
+ * 验证向量化池化 (acfun_maxpool 运行时派发) 与标量参考 (acfun_maxpool_scalar) 逐元素一致
+ * (含 pad / 非 1 stride / post_relu); 再用朴素逐元素参考量化通道向量化的提速。 */
+static void bench_maxpool() {
+    struct CC { int H,W,C,pool,st,pd; } cfgs[] = {
+        {112,112,16,2,2,0}, {56,56,32,2,2,0}, {28,28,64,3,2,1},
+        {224,224,3,2,2,0}, {16,16,8,2,2,0}, {33,31,12,3,2,1},
+        {64,64,128,2,2,0}, {48,48,64,3,1,1}, {57,55,24,2,2,1},
+    };
+    int fails = 0;
+
+    printf("\n=== 最大池化: 正确性 (向量化 vs 标量) ===\n");
+    for (auto& c : cfgs) {
+        int H=c.H,W=c.W,C=c.C,pool=c.pool,st=c.st,pd=c.pd,N=1;
+        int OH=(H+2*pd-pool)/st+1, OW=(W+2*pd-pool)/st+1;
+        if (OH<=0||OW<=0) continue;
+        size_t inN=(size_t)N*H*W*C, outN=(size_t)N*OH*OW*C;
+        std::vector<float> in(inN), ov(outN), os(outN);
+        rand_fill(in.data(), inN);
+        acfun_maxpool(in.data(), N, H, W, C, pool, st, pd, ov.data());
+        acfun_maxpool_scalar(in.data(), N, H, W, C, pool, st, pd, os.data(), 0);
+        float maxd = 0; for (size_t i=0;i<outN;++i) maxd = std::max(maxd, std::fabs(ov[i]-os[i]));
+        bool ok = maxd < 1e-5f; if (!ok) fails++;
+        printf("  %dx%dx%d k%d s%d p%d  max|Δ|=%9.3e %s\n", H,W,C,pool,st,pd,maxd, ok?"OK":"FAIL");
+    }
+
+    printf("\n=== 最大池化 + 融合 ReLU (post_relu): 正确性 (向量化 vs 标量) ===\n");
+    for (auto& c : cfgs) {
+        int H=c.H,W=c.W,C=c.C,pool=c.pool,st=c.st,pd=c.pd,N=1;
+        int OH=(H+2*pd-pool)/st+1, OW=(W+2*pd-pool)/st+1;
+        if (OH<=0||OW<=0) continue;
+        size_t inN=(size_t)N*H*W*C, outN=(size_t)N*OH*OW*C;
+        std::vector<float> in(inN), ov(outN), os(outN);
+        rand_fill(in.data(), inN);
+        acfun_maxpool_relu(in.data(), N, H, W, C, pool, st, pd, ov.data());
+        acfun_maxpool_scalar(in.data(), N, H, W, C, pool, st, pd, os.data(), 1);
+        float maxd = 0; for (size_t i=0;i<outN;++i) maxd = std::max(maxd, std::fabs(ov[i]-os[i]));
+        bool ok = maxd < 1e-5f; if (!ok) fails++;
+        printf("  %dx%dx%d k%d s%d p%d  max|Δ|=%9.3e %s\n", H,W,C,pool,st,pd,maxd, ok?"OK":"FAIL");
+    }
+
+    printf("\n=== 最大池化 加速 (向量化 vs 朴素标量) ===\n");
+    struct SP { int H,W,C,pool,st,pd; } spd[] = {
+        {112,112,16,2,2,0}, {224,224,3,2,2,0}, {56,56,64,2,2,0}, {28,28,128,3,2,1}, {64,64,256,2,2,0},
+    };
+    for (auto& c : spd) {
+        int H=c.H,W=c.W,C=c.C,pool=c.pool,st=c.st,pd=c.pd,N=1;
+        int OH=(H+2*pd-pool)/st+1, OW=(W+2*pd-pool)/st+1;
+        if (OH<=0||OW<=0) continue;
+        size_t inN=(size_t)N*H*W*C, outN=(size_t)N*OH*OW*C;
+        std::vector<float> in(inN), on(outN), ov(outN);
+        rand_fill(in.data(), inN);
+        auto naive = [&](const float* pin, float* pout) {
+            for (int n=0;n<N;++n) for (int oh=0;oh<OH;++oh) for (int ow=0;ow<OW;++ow) for (int cc=0;cc<C;++cc) {
+                float mx=-1e30f;
+                for (int ph=0;ph<pool;++ph){ int ih=oh*st-pd+ph; if(ih<0||ih>=H) continue;
+                    for (int pw=0;pw<pool;++pw){ int iw=ow*st-pd+pw; if(iw<0||iw>=W) continue;
+                        float v=pin[((size_t)n*H+ih)*W*C+iw*C+cc]; if(v>mx) mx=v; } }
+                pout[((size_t)n*OH+oh)*OW*C+ow*C+cc]=mx;
+            }
+        };
+        int reps = (outN > (1u<<24)) ? 5 : 20;
+        double t0=now(); for (int r=0;r<reps;++r) naive(in.data(), on.data()); double tn=(now()-t0)/reps;
+        t0=now(); for (int r=0;r<reps;++r) acfun_maxpool(in.data(), N, H, W, C, pool, st, pd, ov.data()); double tv=(now()-t0)/reps;
+        printf("  %dx%dx%d k%d s%d  naive:%8.3fms(%7.1f/s)  Acfun:%8.3fms(%7.1f/s)  加速%5.2fx\n",
+               H,W,C,pool,st, tn*1e3,1.0/tn, tv*1e3,1.0/tv, tn/tv);
+    }
+    printf("  %s\n", fails==0 ? "最大池化 全部通过" : "最大池化 存在失败");
+}
+
 /* ---------- 6) INT8 GEMM / 卷积 (AVX-512 VNNI) ----------
  * 对标 MNN int8 推理路径: uint8×int8→int32 的 vpdpbusd 累加器。
  * 报告 INT8 GEMM 的 GOPS (2·M·N·K/t, 与 float GFLOPS 同口径便于比对算力吞吐),
@@ -944,6 +1014,7 @@ int main(int argc, char** argv) {
     bench_depthwise();
     bench_grouped();
     bench_fc_relu_fused();
+    bench_maxpool();
     bench_conv_bn_relu_composite();
     bench_int8();
     bench_int8_winograd();

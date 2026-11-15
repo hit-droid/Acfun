@@ -29,6 +29,8 @@ add_library(acfun STATIC
     src/model.cpp
     src/dw.cpp
     src/dw_avx512.cpp
+    src/maxpool_avx2.cpp
+    src/maxpool_avx512.cpp
 )
 target_include_directories(acfun PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -56,6 +58,10 @@ set_source_files_properties(src/winograd_int8.cpp PROPERTIES COMPILE_FLAGS "-mav
 
 # 深度(逐通道)卷积: 跨通道 16 路 AVX-512 向量化 + 权重预转置常驻 L1。仅需 AVX-512F+FMA。
 set_source_files_properties(src/dw_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma")
+
+# 最大池化: 通道向量化 (AVX-512 / AVX2), 运行时按 CPU 特性派发; 标量版 (layers.cpp) 作兜底。
+set_source_files_properties(src/maxpool_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma")
+set_source_files_properties(src/maxpool_avx2.cpp PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
 
 add_executable(acfun_bench src/benchmark.cpp)
 target_link_libraries(acfun_bench PRIVATE acfun)

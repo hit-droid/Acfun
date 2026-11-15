@@ -207,8 +207,10 @@ void acfun_conv2d_g(const float* input, int N, int H, int W, int Cin,
                 groups > 1 ? groups : 1, output, act);
 }
 
-void acfun_maxpool(const float* in, int N, int H, int W, int C,
-                   int pool, int stride, int pad, float* out) {
+/* 标量 (通用 -O3) 最大池化: 正确性基线, 同时作为无 SIMD 主机的可移植兜底。
+ * post_relu != 0 时在池化输出上就地 ReLU (与先 Pool 再独立 ReLU 数学等价)。 */
+void acfun_maxpool_scalar(const float* in, int N, int H, int W, int C,
+                          int pool, int stride, int pad, float* out, int post_relu) {
     int OH = (H + 2 * pad - pool) / stride + 1;
     int OW = (W + 2 * pad - pool) / stride + 1;
     if (OH <= 0 || OW <= 0) return;
@@ -226,11 +228,36 @@ void acfun_maxpool(const float* in, int N, int H, int W, int C,
                             if (v > mx) mx = v;
                         }
                     }
+                    if (post_relu && mx < 0.0f) mx = 0.0f;
                     out[((size_t)n * OH + oh) * OW * C + ow * C + c] = mx;
                 }
             }
         }
     }
+}
+
+/* 运行时派发: 通道数足够大且 CPU 支持对应指令集时走向量化后端 (AVX-512 优先, 其次 AVX2),
+ * 否则回落标量; 三者算法严格等价 (越界位置跳过 / post_relu 就地 ReLU)。 */
+static void maxpool_impl(const float* in, int N, int H, int W, int C,
+                         int pool, int stride, int pad, float* out, int post_relu) {
+    if (C >= 16 && __builtin_cpu_supports("avx512f"))
+        acfun_maxpool_avx512(in, N, H, W, C, pool, stride, pad, out, post_relu);
+    else if (C >= 8 && __builtin_cpu_supports("avx2"))
+        acfun_maxpool_avx2(in, N, H, W, C, pool, stride, pad, out, post_relu);
+    else
+        acfun_maxpool_scalar(in, N, H, W, C, pool, stride, pad, out, post_relu);
+}
+
+void acfun_maxpool(const float* in, int N, int H, int W, int C,
+                   int pool, int stride, int pad, float* out) {
+    maxpool_impl(in, N, H, W, C, pool, stride, pad, out, 0);
+}
+
+/* 池化 + 融合 ReLU (post_relu): 在池化输出写回时就地施加 ReLU, 省去独立的激活扫描遍
+ * (与先 Pool 再 acfun_relu 数学等价, 仅运算顺序不同)。供 MaxPool→ReLU 融合路径调用。 */
+void acfun_maxpool_relu(const float* in, int N, int H, int W, int C,
+                        int pool, int stride, int pad, float* out) {
+    maxpool_impl(in, N, H, W, C, pool, stride, pad, out, 1);
 }
 
 void acfun_softmax(const float* in, int rows, int cols, float* out) {

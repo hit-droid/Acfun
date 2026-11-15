@@ -105,6 +105,11 @@ void acfun_relu6(float* data, size_t len);
 void acfun_maxpool(const float* input, int N, int H, int W, int C,
                    int pool, int stride, int pad, float* output);
 
+/* 最大池化 + 融合 ReLU: 池化输出写回时就地施加 ReLU (与先 Pool 再独立 ReLU 数学等价,
+ * 省去独立的激活扫描遍; 由 MaxPool→ReLU 融合路径自动调用)。 */
+void acfun_maxpool_relu(const float* input, int N, int H, int W, int C,
+                        int pool, int stride, int pad, float* output);
+
 /* Softmax (沿最后一维) */
 void acfun_softmax(const float* input, int rows, int cols, float* output);
 

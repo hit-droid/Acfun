@@ -122,6 +122,16 @@ int  acfun_get_tuned_kc_nc(int nt, int* KC, int* NC);
 int  acfun_get_tuned_kc_nc_int8(int nt, int* KC, int* NC);
 const char* acfun_tune_status(void);
 
+/* 最大池化: 通道向量化 (AVX-512 / AVX2) + 标量兜底, 运行时按 CPU 特性派发。
+ * post_relu != 0 时在池化输出上就地施加 ReLU (与先 Pool 再独立 ReLU 数学等价, 二者
+ * 仅运算顺序不同, 可合并到池化单遍, 省去独立激活扫描)。 */
+void acfun_maxpool_scalar(const float* in, int N, int H, int W, int C,
+                          int pool, int stride, int pad, float* out, int post_relu);
+void acfun_maxpool_avx2(const float* in, int N, int H, int W, int C,
+                        int pool, int stride, int pad, float* out, int post_relu);
+void acfun_maxpool_avx512(const float* in, int N, int H, int W, int C,
+                          int pool, int stride, int pad, float* out, int post_relu);
+
 /* 生效核心数: 取物理核数与 cgroup CPU 配额(cpu.max / cfs_quota)的较小值,
  * 避免多线程在受限容器内争抢导致上下文切换风暴 (例如 16 线程抢 4 核配额)。
  * 无 cgroup 限制时回退物理核数。供 GEMM/卷积并行区设置 num_threads 上限。 */
