@@ -116,6 +116,16 @@ static void conv2d_impl(const float* input, int N, int H, int W, int Cin,
         }
         int Cin_per  = Cin / groups;
         int Cout_per = Cout / groups;
+        /* 小通道组 (Cin_per≤8, Cout_per≤16) 走 fused 直接内核: 这种分组的子卷积
+         * 算术量极小, 原「逐组抽取 in_g → 递归子路径(小图小通道走 Winograd/极小
+         * GEMM) → 写回 out_g」三明治的固定开销被 groups 次放大, 实测较朴素直乘慢
+         * 3–10× (g8/g6 用例)。fused 内核沿组内 oc 16 路向量化、一次写回 NHWC,
+         * 消除中间缓冲与逐组派发开销 (对标 MNN group conv 专属路径)。 */
+        if (Cin_per <= 8 && Cout_per <= 16 && KH <= 5 && KW <= 5) {
+            acfun_conv2d_grouped_small(input, N, H, W, Cin, weight, bias,
+                                       KH, KW, Cout, stride, pad, groups, output, act);
+            return;
+        }
         int OH = (H + 2 * pad - KH) / stride + 1;
         int OW = (W + 2 * pad - KW) / stride + 1;
         if (OH <= 0 || OW <= 0) return;

@@ -31,6 +31,8 @@ add_library(acfun STATIC
     src/dw_avx512.cpp
     src/maxpool_avx2.cpp
     src/maxpool_avx512.cpp
+    src/group_conv.cpp
+    src/group_conv_avx512.cpp
 )
 target_include_directories(acfun PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -62,6 +64,10 @@ set_source_files_properties(src/dw_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512
 # 最大池化: 通道向量化 (AVX-512 / AVX2), 运行时按 CPU 特性派发; 标量版 (layers.cpp) 作兜底。
 set_source_files_properties(src/maxpool_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma")
 set_source_files_properties(src/maxpool_avx2.cpp PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
+
+# 小通道组分组卷积: 沿组内 oc 16 路 AVX-512 向量化 + 寄存器驻留累加 + 一次写回,
+# 消除逐组 in_g/out_g 抽取与逐组 GEMM/Winograd 派发。仅需 AVX-512F+FMA。
+set_source_files_properties(src/group_conv_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma")
 
 add_executable(acfun_bench src/benchmark.cpp)
 target_link_libraries(acfun_bench PRIVATE acfun)

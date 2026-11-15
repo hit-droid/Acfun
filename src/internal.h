@@ -86,6 +86,23 @@ void acfun_conv2d_dw_scalar(const float* input, int N, int H, int W, int C,
                             int KH, int KW, int stride, int pad,
                             float* output, int act);
 
+/* 小通道组分组卷积 (fused 直接内核, 对标 MNN 的 group conv 专属路径):
+ * 权重布局 [g][kh][kw][ic][oc] (组内 oc 连续), 输出 NHWC; 沿组内 oc 16 路向量化,
+ * 无 in_g/out_g 中间缓冲、无逐组 GEMM/Winograd 派发。由 layers.cpp 在小组且非深度
+ * 卷积时路由, AVX-512 内核与标量兜底分别实现。 */
+void acfun_conv2d_grouped_small(const float* input, int N, int H, int W, int Cin,
+                                const float* weight, const float* bias,
+                                int KH, int KW, int Cout, int stride, int pad,
+                                int groups, float* output, int act);
+void acfun_conv2d_grouped_small_avx512(const float* input, int N, int H, int W, int Cin,
+                                       const float* weight, const float* bias,
+                                       int KH, int KW, int Cout, int stride, int pad,
+                                       int groups, float* output, int act);
+void acfun_conv2d_grouped_small_scalar(const float* input, int N, int H, int W, int Cin,
+                                       const float* weight, const float* bias,
+                                       int KH, int KW, int Cout, int stride, int pad,
+                                       int groups, float* output, int act);
+
 /* 调度器下发的期望线程数 (1 = 串行); 后端据此选择串行或 omp parallel num_threads */
 void acfun_set_num_threads_runtime(int n);
 int  acfun_get_num_threads_runtime(void);
