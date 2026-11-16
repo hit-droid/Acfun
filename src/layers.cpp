@@ -119,6 +119,15 @@ static void conv2d_impl(const float* input, int N, int H, int W, int Cin,
         int OH = (H + 2 * pad - KH) / stride + 1;
         int OW = (W + 2 * pad - KW) / stride + 1;
         if (OH <= 0 || OW <= 0) return;
+        /* 直接分组卷积快路径: 当每组通道较小时, 旧「抽取 + im2col + 小 GEMM + 拷回」的固定
+         * 开销远超算力 (最坏比朴素直乘还慢 5x)。直接卷积原地读写 NHWC + 输出通道向量化,
+         * 对中小 Cin_per/Cout_per 全面胜出。仅当每组通道都很大 (GEMM 的数据复用收益超过
+         * 抽取开销) 时才保留旧 im2col+GEMM 路径。 */
+        if (Cin_per <= 64 && Cout_per <= 128) {
+            acfun_conv2d_grouped(input, N, H, W, Cin, weight, bias, KH, KW, Cout,
+                                 stride, pad, groups, output, act);
+            return;
+        }
         /* NHWC 下各组的输入/输出通道在每像素内连续, 但像素间步长 = 总通道数,
          * 无法用单一指针偏移表达, 故每组先抽取连续缓冲再调用引擎子路径,
          * 权重块本就按 [(kh,kw,ic)][oc] 连续存放无需重排。 */

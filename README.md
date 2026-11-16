@@ -89,10 +89,13 @@ NHWC 下跨 6 行 gather、且边界瓦片填充浪费更高，**仅在 `H≥112
     用 AVX-512 掩码 load/store 处理尾通道，padding 区域以掩码加载为零，彻底避免边界分支。
   - 标量参考实现 `src/dw.cpp`（驱动派发，按 `__builtin_cpu_supports("avx512f")` 选后端）。
 - **`acfun_conv2d_g`**：通用**分组卷积**（groups 组，每组建 `Cin/groups`、`Cout/groups` 通道，
-  权重布局 `[groups, Cout_per, KH·KW·Cin_per]`，组间连续）。
+  权重布局 `[groups, KH·KW·Cin_per, Cout_per]`（`oc` 连续），组间连续）。
   - **自动路由**：`groups==Cin==Cout` 时直接落入深度卷积路径（零额外开销）；否则
-    按组把输入/输出抽取到连续临时缓冲，对每组复用引擎既有 1×1 / Winograd / im2col 子路径——
-    与 MNN 的分组卷积实现思路一致（NHWC 下各组通道交错，故需先聚合成连续块再调用）。
+    **v1.4.0 起走直接分组卷积内核**（`src/group_conv*.cpp`）：以输出通道 `oc` 为向量维度，
+    直接读 NHWC 输入 / 写 NHWC 输出、跨 16 路（AVX-512）或 8 路（AVX2）FMA 累加，
+    **完全省去旧实现的逐组输入抽取 / im2col / 拷回**——旧路径在每组通道较小时固定开销主导，
+    最坏（`14×14×24→48 g6`）比朴素直乘还慢 5×，新路径全面领先（7–24×，见 §分组卷积基准）。
+    仅当每组通道都很大（`Cin_per>64 || Cout_per>128`，GEMM 数据复用收益超过抽取开销）时保留旧路径。
   - **BN 折叠组感知**：`fold_bn_into` 按组索引（`gc=c/Cout_per`、`oc=c%Cout_per`、权重全局偏移
     `gc·Cout_per·per_in + t·Cout_per + oc`，并除以 `groups` 修正权重计数），Conv/BN/ReLU 融合对
     分组层同样生效。
@@ -506,9 +509,20 @@ f32 累加：
 | 14² × 24→48 k3 g6 | 0.11 ms (9392/s) | 0.064 ms (15724/s) | **1.7×** |
 | 56² × 32→32 k3 g32 | 3.28 ms (305/s) | 0.10 ms (9851/s) | **32.3×** |
 
-> `groups==Cin==Cout` 自动路由到深度卷积（零额外开销）；其余分组按组抽取连续缓冲后复用既有
-> 1×1 / Winograd / im2col 子路径，与之同速（见 `bench_grouped`）。32 组纯深度卷积较朴素分组参考
-> 达 32×，低频组（g4/g8）受每组建模开销影响约 2–4×。
+> 上表为旧「抽取+im2col+小 GEMM」路径的历史数据。**v1.4.0 直接分组卷积内核**（沙箱 AVX-512 Zen5，
+> 4 核 cgroup，`bench_grouped` 实测，`max|Δ|<3e-6`）全面改观：
+
+| 配置 | 朴素直乘 | 旧引擎(v1.3.0) | v1.4.0 直接内核 | 加速 |
+|------|----------|----------------|-----------------|------|
+| 56² × 16→32 k3 g4 | 3.15 ms | 0.604 ms (5.2×) | **0.348 ms** | **9.0×** |
+| 28² × 32→64 k1 g8 | 0.522 ms | 0.490 ms (1.1×) | **0.037 ms** | **13.9×** |
+| 14² × 24→48 k3 g6 | 0.063 ms | 0.300 ms (**0.2×** 回退) | **0.008 ms** | **7.7×** |
+| 32² × 32→64 k3 g8 | 2.248 ms | — | **0.221 ms** | **10.2×** |
+| 56² × 64→128 k1 g8 | 5.532 ms | — | **0.227 ms** | **24.4×** |
+| 28² × 48→96 k3 g6 | 3.495 ms | — | **0.249 ms** | **14.0×** |
+
+> 关键修复：旧路径在 `14² g6` 上因逐组抽取/拷回的固定开销**比朴素直乘还慢 5×（0.2×）**，v1.4.0
+> 直接内核原地读写 NHWC + 输出通道向量化后达 **7–24×**。`groups==Cin==Cout` 仍走深度卷积路径（~30×）。
 
 ---
 
@@ -570,8 +584,9 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   **最大池化通道向量化（AVX-512 16 路 / AVX2 8 路 `vmaxps` 归约，运行时派发，标量版作基线/兜底，
   宽通道较朴素标量 ~4–16×、`max|Δ|=0`）**、**池化图优化（ReLU→MaxPool 冗余消除 + MaxPool→ReLU
   融合，零数值风险，对标 MNN 的层/图融合）**、
-  **分组卷积（通用 groups，含 BN 折叠组感知；`groups==Cin==Cout` 自动路由深度卷积，否则各组复用
-  1×1/Winograd/im2col 子路径，较朴素分组参考 ~1.7–32×、`max|Δ|<4e-6`，模型 type 7 已支持）**、
+  **分组卷积（通用 groups，含 BN 折叠组感知；`groups==Cin==Cout` 自动路由深度卷积，否则走 v1.4.0
+  直接分组卷积内核——输出通道向量化 (AVX-512 16 路 / AVX2 8 路)、原地读写 NHWC、无抽取/im2col/拷回，
+  较朴素分组参考 ~7–32×（修复旧路径 g6 的 0.2× 回退）、`max|Δ|<3e-6`，模型 type 7 已支持）**、
   **GEMM 自动调参（autotuning：运行时按硬件实测最优 KC/NC 分块 + 多尺寸无回归门控 + 本地缓存复用 +
   常见服务端 CPU 参考表，单线程 GEMM +2–5%、零回归）**、**INT8 GEMM 自动调参（autotuning 扩展到
   INT8 分块，与 float 同缓存持久化，单线程小/中尺寸反超 float 路径）**、
@@ -623,6 +638,9 @@ src/winograd_int8.cpp   INT8 Winograd 3×3 整数域快速卷积（AVX-512 `vpma
 src/layers.cpp          卷积（含融合 ReLU / Winograd / 深度&分组 自动路由）、全连接、FC+ReLU 融合、激活、池化、Softmax、BN
 src/dw.cpp              深度卷积（逐通道）标量参考 + AVX-512 派发
 src/dw_avx512.cpp       深度卷积 AVX-512 跨通道 16 路向量化内核（-mavx512f -mfma 独立单元）
+src/group_conv.cpp      分组卷积直接内核调度器（按 Cout_per 派发 AVX-512/AVX2/标量）+ 标量参考
+src/group_conv_avx512.cpp 分组卷积 AVX-512 输出通道 16 路直接卷积内核（-mavx512f -mfma 独立单元）
+src/group_conv_avx2.cpp 分组卷积 AVX2 输出通道 8 路直接卷积内核（-mavx2 -mfma 独立单元）
 src/maxpool_avx2.cpp    最大池化 AVX2 通道向量化内核（-mavx2 -mfma 独立单元）
 src/maxpool_avx512.cpp  最大池化 AVX-512 通道向量化内核（-mavx512f -mfma 独立单元）
 src/model.cpp           二进制模型加载（含 BN 折叠/ReLU 融合/池化图优化、type 7 分组卷积）与顺序执行器

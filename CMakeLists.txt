@@ -29,6 +29,9 @@ add_library(acfun STATIC
     src/model.cpp
     src/dw.cpp
     src/dw_avx512.cpp
+    src/group_conv.cpp
+    src/group_conv_avx2.cpp
+    src/group_conv_avx512.cpp
     src/maxpool_avx2.cpp
     src/maxpool_avx512.cpp
 )
@@ -58,6 +61,11 @@ set_source_files_properties(src/winograd_int8.cpp PROPERTIES COMPILE_FLAGS "-mav
 
 # 深度(逐通道)卷积: 跨通道 16 路 AVX-512 向量化 + 权重预转置常驻 L1。仅需 AVX-512F+FMA。
 set_source_files_properties(src/dw_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma")
+
+# 分组卷积直接内核: 跨输出通道向量化 (AVX-512 / AVX2), 运行时按 Cout_per 与 CPU 特性派发;
+# 标量版 (group_conv.cpp) 作兜底。相较旧 im2col+小 GEMM 路径, 省去逐组抽取/拷回与 im2col 开销。
+set_source_files_properties(src/group_conv_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma")
+set_source_files_properties(src/group_conv_avx2.cpp PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
 
 # 最大池化: 通道向量化 (AVX-512 / AVX2), 运行时按 CPU 特性派发; 标量版 (layers.cpp) 作兜底。
 set_source_files_properties(src/maxpool_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma")

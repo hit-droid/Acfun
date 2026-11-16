@@ -86,6 +86,27 @@ void acfun_conv2d_dw_scalar(const float* input, int N, int H, int W, int C,
                             int KH, int KW, int stride, int pad,
                             float* output, int act);
 
+/* ---- 分组卷积直接内核 (groups>1 且非深度) ----
+ * 权重布局 [groups][KH*KW*Cin_per][Cout_per] (oc 连续), 与朴素参考/旧 im2col 路径一致。
+ * 直接读 NHWC 输入、按输出通道向量化、直接写 NHWC 输出, 省去旧路径的逐组抽取/im2col/拷回。
+ * 调度器按 Cout_per 与 CPU 特性在 AVX-512 / AVX2 / 标量间派发。 */
+void acfun_conv2d_grouped(const float* input, int N, int H, int W, int Cin,
+                          const float* weight, const float* bias,
+                          int KH, int KW, int Cout, int stride, int pad,
+                          int groups, float* output, int act);
+void acfun_group_conv_scalar(const float* input, int N, int H, int W, int Cin,
+                             const float* weight, const float* bias,
+                             int KH, int KW, int Cout, int stride, int pad,
+                             int groups, float* output, int act);
+void acfun_group_conv_avx2(const float* input, int N, int H, int W, int Cin,
+                           const float* weight, const float* bias,
+                           int KH, int KW, int Cout, int stride, int pad,
+                           int groups, float* output, int act);
+void acfun_group_conv_avx512(const float* input, int N, int H, int W, int Cin,
+                             const float* weight, const float* bias,
+                             int KH, int KW, int Cout, int stride, int pad,
+                             int groups, float* output, int act);
+
 /* 调度器下发的期望线程数 (1 = 串行); 后端据此选择串行或 omp parallel num_threads */
 void acfun_set_num_threads_runtime(int n);
 int  acfun_get_num_threads_runtime(void);
