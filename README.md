@@ -599,6 +599,13 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   中间缓冲、一写到位。跨 8 组尺寸（含非整除边界）`max|Δ|=0` 严格等价、零回归；FC / 卷积删去 `gemm_out`
   中间缓冲与独立扫描，给出确定性的内存/代码路径收益（共享 cgroup 主机上墙钟加速被 GEMM 本体噪声
   掩盖，约 ~1.0–1.1×，裸机/窄 N 卷积场景收益更明显）。
+- ✅ **INT8 GEMM Epilogue 融合（反量化 + 零点校正 + bias + ReLU 折叠进 VNNI 微内核写回，对标 MNN
+  INT8 store fusion，v1.5.0 新增）**：新增 `acfun_gemm_int8_epi`，把 INT8 卷积后处理
+  `×alpha[j] + beta[j]`（`alpha=激活scale×权重scale`、`beta=bias−alpha·ZP·Sw` 已含零点校正）
+  折叠进 `vpdpbusd` 微内核写回，用 gather + 显式 `mul`+`add`（`-ffp-contract=off` 保证与标量
+  同舍入）+ 无分支 `vmax` 直接写 float，**彻底删去 int32 中间缓冲与独立一遍全张量反量化扫描**；
+  INT8 卷积 im2col 路径已接线。跨 25 组尺寸/边界（含 gather 钳位）与标量/非融合严格 `max|Δ|=0`，
+  原 `acfun_gemm_int8` 零回归。
 - ✅ 单线程效率：AVX-512 参考主机实测 **~75–90%** 单核 FMA 峰值（EPYC 9754 Zen4c 真实峰值
   ~83 GFLOPS/核），已进入 MNN 同量级单线程效率区间；当前 AVX2 开发沙箱单线程 GEMM ~32 GFLOPS。
 - ✅ **GEMM 多核扩展修复（v0.9.1）**：`acfun_gemm` 默认线程数改取 `acfun_effective_cores()`
@@ -647,6 +654,7 @@ src/model.cpp           二进制模型加载（含 BN 折叠/ReLU 融合/池化
 src/benchmark.cpp       正确性 + GEMM/卷积/端到端/融合/FC+ReLU 融合 基准（含多线程扩展曲线）
 tools/gen_model.py      测试模型生成器
 tools/test_bf16.cpp       BF16 GEMM 独立验证（正确性 + 吞吐 vs float，独立编译运行）
+tools/test_int8_epi.cpp  INT8 GEMM epilogue 融合独立验证（融合 vs 非融合严格 max|Δ|=0，含 gather 钳位边界）
 ```
 
 ## License

@@ -128,6 +128,24 @@ void acfun_gemm_int8_ref_ld(int M, int N, int K,
 void acfun_gemm_int8_avx512(int M, int N, int K,
                             const uint8_t* A, const int8_t* B, int32_t* C);
 
+/* INT8 GEMM epilogue 融合 (对标 MNN store fusion): 把 INT8 卷积后处理
+ *   C[m,j] = (Σ_k A[m,k]·B[k,j]) · alpha[j] + beta[j]  (+ReLU if act)
+ * 折叠进微内核写回阶段, 直接写 float, 消除「GEMM 写 int32 中间缓冲 -> 独立一遍
+ * 反量化/bias/零点校正/ReLU 全张量扫描」。alpha/beta 为长度 N 的每通道因子,
+ * 由调用方把 激活scale×权重scale 折进 alpha, 把 bias 与零点校正折进 beta。
+ * 数值上与「acfun_gemm_int8 写 int32 + 独立反量化扫描(同 alpha/beta)」严格等价。 */
+void acfun_gemm_int8_epi(int M, int N, int K,
+                         const uint8_t* A, const int8_t* B, float* C,
+                         const float* alpha, const float* beta, int act);
+/* 标量参考 (正确性基线, 亦为无 VNNI 主机的落地点) */
+void acfun_gemm_int8_epi_ref(int M, int N, int K,
+                             const uint8_t* A, const int8_t* B, float* C,
+                             const float* alpha, const float* beta, int act);
+/* AVX-512 VNNI 后端 (编译单元带 -mavx512f -mfma -mavx512vnni) */
+void acfun_gemm_int8_epi_avx512(int M, int N, int K,
+                                const uint8_t* A, const int8_t* B, float* C,
+                                const float* alpha, const float* beta, int act);
+
 /* INT8 Winograd F(2,3) 3x3 卷积 (整数域, 对标 MNN int8 路径): 3x3 / stride1 / pad1,
  * float 输入 (本函数内就地量化, 零点 zp=128), 逐通道 int8 权重。inv_s = 127/max|x|。
  * 由 conv_int8.cpp 在 3x3/s1/p1 且通道>=4 时自动路由, 省去独立的整张输入量化遍。 */

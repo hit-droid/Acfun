@@ -201,6 +201,27 @@ M=N=K        float-GFLOPS      int8-GOPS   1T INT8/FP     MT加速
   24x24x8->64  FP:  0.104ms(9602.2/s)  INT8:  0.132ms(7563.7/s)  加速0.8x  max|Δ|/范数=  0.47% OK
   * INT8 Winograd 较 float 卷积 乘法量降 2.25x, 带宽仅 int8/int16; 精度损失来自逐张量激活量化
 
+=== INT8 GEMM 融合后处理 正确性 (acfun_gemm_int8_epi vs 非融合参考) ===
+  (v1.5.0 新增; 反量化×alpha + beta(含零点校正) + ReLU 折叠进 VNNI 微内核写回)
+    64x  64x  64 act=1  max|Δ|=0.000e+00  OK
+   100x 100x 100 act=1  max|Δ|=0.000e+00  OK
+   255x 255x 255 act=0  max|Δ|=0.000e+00  OK
+   512x  17x  64 act=1  max|Δ|=0.000e+00  OK
+    63x 512x  33 act=1  max|Δ|=0.000e+00  OK
+   127x 129x  63 act=0  max|Δ|=0.000e+00  OK
+  1023x   4x   7 act=1  max|Δ|=0.000e+00  OK
+  (独立工具 tools/test_int8_epi.cpp 另覆盖 25 组含 gather 钳位/MT 边界, 全部 max|Δ|=0)
+
+=== INT8 GEMM 融合后处理 吞吐 (epilogue vs 独立扫描, 单线程) ===
+  消除 int32 中间缓冲 + 一遍全张量读改写; 窄 N(卷积类)场景收益更明显
+M×N×K         非融合(ms)  融合epi(ms)     加速
+1024x1024x1024        30.746ms        23.932ms      1.28x
+2048x2048x2048       214.196ms       189.171ms      1.13x
+12544x16x144           9.015ms         8.148ms      1.11x
+50176x16x27           11.334ms         7.760ms      1.46x
+  * 数学严格等价(max|Δ|=0); 确定性收益=去 int32 中间缓冲 + 去独立全张量扫描
+  * GEMM 本体大的方阵中墙钟加速被 GEMM 噪声掩盖, 窄 N(卷积类)场景收益更清晰
+
 === BF16 GEMM 正确性 (Acfun bf16 vs 标量参考) ===
   M=N=K=  64  max|Δ|/范数=1.515e-03 OK
   M=N=K= 100  max|Δ|/范数=2.207e-03 OK

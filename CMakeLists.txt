@@ -44,7 +44,9 @@ target_link_libraries(acfun PUBLIC OpenMP::OpenMP_CXX)
 # 仅 SIMD 内核携带对应指令集
 set_source_files_properties(src/gemm_avx2.cpp   PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
 set_source_files_properties(src/gemm_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma")
-set_source_files_properties(src/gemm_int8_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma -mavx512vnni")
+# -ffp-contract=off: epilogue 反量化用显式 mul+add(两次舍入), 与无 -mfma 的标量参考
+# acfun_gemm_int8_epi_ref 舍入顺序严格一致, 保证 SIMD 与标量逐元素 max|Δ|=0。
+set_source_files_properties(src/gemm_int8_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma -mavx512vnni -ffp-contract=off")
 # BF16 GEMM: AVX-512 BF16 的 vdpbf16_ps, 整数/bf16 点积累加到 f32, 带宽仅 float 之半;
 # 仅在检测到 avx512_bf16 时由基准 (bench_bf16) 调用, 否则回落 acfun_gemm。
 set_source_files_properties(src/gemm_bf16_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma -mavx512bf16")

@@ -14,6 +14,7 @@
 #include <vector>
 #include <random>
 #include <algorithm>
+#include <string>
 
 static double now() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -913,6 +914,88 @@ static void bench_bf16() {
     printf("  * BF16 带宽仅 float 之半、f32 累加; 与 MNN 的 bf16/int8 低精度路径同构\n");
 }
 
+/* ---------- INT8 GEMM epilogue 融合: 正确性 + 吞吐 ----------
+ * 对标 MNN store fusion: 把 INT8 卷积后处理「×alpha + beta + 可选 ReLU」折叠进
+ * INT8 GEMM 微内核写回, 消除「GEMM 写 int32 中间缓冲 -> 独立一遍全张量反量化扫描」。
+ * 参考为「acfun_gemm_int8 写 int32 + 独立反量化(同 alpha/beta)」, 应逐元素 max|Δ|=0。 */
+static int correctness_int8_epi() {
+    printf("\n=== INT8 GEMM 融合后处理 正确性 (acfun_gemm_int8_epi vs 非融合参考) ===\n");
+    int fails = 0;
+    struct S { int M, N, K; int act; } cfgs[] = {
+        {64,64,64,1}, {100,100,100,1}, {255,255,255,0},
+        {512,17,64,1}, {63,512,33,1}, {127,129,63,0}, {1023,4,7,1},
+    };
+    int sv = 90001;
+    for (auto& c : cfgs) {
+        std::vector<uint8_t> A((size_t)c.M * c.K);
+        std::vector<int8_t>  B((size_t)c.K * c.N);
+        for (size_t i = 0; i < A.size(); ++i) A[i] = (uint8_t)((sv = sv * 1103515245 + 12345) >> 16);
+        for (size_t i = 0; i < B.size(); ++i) B[i] = (int8_t)(((sv = sv * 1103515245 + 12345) >> 16) % 256 - 128);
+        std::vector<float> alpha(c.N), beta(c.N);
+        for (int j = 0; j < c.N; ++j) { alpha[j] = 0.001f + 0.0005f * (j % 13); beta[j] = -0.3f + 0.02f * (j % 7); }
+        std::vector<int32_t> i32((size_t)c.M * c.N);
+        std::vector<float> cref((size_t)c.M * c.N), csim((size_t)c.M * c.N);
+        acfun_gemm_int8(c.M, c.N, c.K, A.data(), B.data(), i32.data());
+        for (int i = 0; i < c.M; ++i)
+            for (int j = 0; j < c.N; ++j) {
+                float v = (float)i32[(size_t)i * c.N + j] * alpha[j] + beta[j];
+                if (c.act && v < 0.0f) v = 0.0f;
+                cref[(size_t)i * c.N + j] = v;
+            }
+        acfun_gemm_int8_epi(c.M, c.N, c.K, A.data(), B.data(), csim.data(), alpha.data(), beta.data(), c.act);
+        float maxd = 0.0f;
+        for (size_t i = 0; i < cref.size(); ++i) maxd = std::max(maxd, std::fabs(cref[i] - csim[i]));
+        bool ok = (maxd == 0.0f);
+        printf("  %4dx%4dx%4d act=%d  max|Δ|=%.3e  %s\n", c.M, c.N, c.K, c.act, maxd, ok ? "OK" : "FAIL");
+        if (!ok) ++fails;
+    }
+    return fails;
+}
+
+static void bench_int8_epi() {
+    printf("\n=== INT8 GEMM 融合后处理 吞吐 (epilogue vs 独立扫描) ===\n");
+    int mt_threads = 8;
+    const char* env = std::getenv("ACFUN_BENCH_THREADS");
+    if (env) mt_threads = std::atoi(env);
+    int eff = acfun_effective_cores(); if (mt_threads > eff) mt_threads = eff;
+    printf("  单线程对比 (消除 int32 中间缓冲 + 一遍全张量读改写; 窄 N 场景收益更明显)\n");
+    printf("%-14s %14s %14s %10s\n", "M×N×K", "非融合(ms)", "融合epi(ms)", "加速");
+    struct S { int M, N, K; } cfgs[] = {
+        {1024,1024,1024}, {2048,2048,2048}, {12544,16,144}, {50176,16,27},
+    };
+    int sv = 777;
+    for (auto& c : cfgs) {
+        std::vector<uint8_t> A((size_t)c.M * c.K);
+        std::vector<int8_t>  B((size_t)c.K * c.N);
+        for (size_t i = 0; i < A.size(); ++i) A[i] = (uint8_t)((sv = sv * 1103515245 + 12345) >> 16);
+        for (size_t i = 0; i < B.size(); ++i) B[i] = (int8_t)(((sv = sv * 1103515245 + 12345) >> 16) % 256 - 128);
+        std::vector<float> alpha(c.N), beta(c.N);
+        for (int j = 0; j < c.N; ++j) { alpha[j] = 0.001f; beta[j] = 0.01f * (float)(j % 5); }
+        std::vector<int32_t> i32((size_t)c.M * c.N);
+        std::vector<float> C1((size_t)c.M * c.N), C2((size_t)c.M * c.N);
+        int reps = (c.M * c.N > (1u << 24)) ? 5 : 15;
+        acfun_set_num_threads_runtime(1);
+        double t0 = now();
+        for (int r = 0; r < reps; ++r) {
+            acfun_gemm_int8(c.M, c.N, c.K, A.data(), B.data(), i32.data());
+            for (size_t i = 0; i < (size_t)c.M * c.N; ++i) {
+                float v = (float)i32[i] * alpha[i % c.N] + beta[i % c.N];
+                C1[i] = v < 0.0f ? 0.0f : v;
+            }
+        }
+        double tUn = (now() - t0) / reps;
+        t0 = now();
+        for (int r = 0; r < reps; ++r)
+            acfun_gemm_int8_epi(c.M, c.N, c.K, A.data(), B.data(), C2.data(), alpha.data(), beta.data(), 1);
+        double tEpi = (now() - t0) / reps;
+        printf("%-14s %13.3fms %13.3fms %9.2fx\n",
+               (std::to_string(c.M) + "x" + std::to_string(c.N) + "x" + std::to_string(c.K)).c_str(),
+               tUn * 1e3, tEpi * 1e3, tUn / tEpi);
+    }
+    printf("  * 数学严格等价(max|Δ|=0); 确定性收益=去 int32 中间缓冲 + 去独立全张量扫描;\n");
+    printf("  * GEMM 本体大的方阵中墙钟加速被 GEMM 噪声掩盖, 窄 N(卷积类)场景收益更清晰。\n");
+}
+
 /* ---------- 1c) GEMM 融合后处理 (epilogue) 正确性 ----------
  * 以 "acfun_gemm + 独立偏置/ReLU 遍" 作参考, 与融合版 acfun_gemm_epi 严格比对。
  * 覆盖非整除边界尺寸、有无偏置、act=0/1, 验证 bias 仅在归约完成后叠加一次。 */
@@ -1005,6 +1088,7 @@ int main(int argc, char** argv) {
     printf(">>> GEMM 调参状态: %s\n", acfun_tune_status());
     int fails = correctness();
     fails += correctness_int8();
+    fails += correctness_int8_epi();
     fails += correctness_epi();
     bench_gemm();
     bench_gemm_scale();
@@ -1023,6 +1107,7 @@ int main(int argc, char** argv) {
     bench_conv_bn_relu_composite();
     bench_int8();
     bench_int8_winograd();
+    bench_int8_epi();
     bench_bf16();
     printf("\n正确性: %s\n", fails == 0 ? "全部通过" : "存在失败");
     return fails == 0 ? 0 : 1;

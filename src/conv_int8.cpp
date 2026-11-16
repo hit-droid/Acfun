@@ -107,26 +107,21 @@ void acfun_conv2d_int8(const float* input, int N_, int H, int W, int Cin,
         Aptr = Aq.data();
     }
 
-    /* 3) INT8 GEMM: A[M,K](uint8) × B[K,Cout](int8, =wq) -> int32[M,Cout], 多线程复用引擎派发 */
-    std::vector<int32_t> i32((size_t)M * Cout);
-    acfun_gemm_int8((int)M, Cout, K, Aptr, wq, i32.data());
-
-    /* 4) 反量化 (+bias 零点校正, 可选 ReLU)。
-     *    内积 i32[j] = Σ_k x_q[k]·w_q[k,j]; 真实 ≈ s_a·s_w[j]·(i32[j] − zp·Sw[j]),
-     *    Sw[j]=Σ_k w_q[k,j] 为每通道量化权重之和, −zp·Sw[j] 作为零点偏置校正并入 bias。 */
-    std::vector<float> Sw(Cout, 0.0f);
-    for (int j = 0; j < Cout; ++j)
-        for (int k = 0; k < K; ++k)
-            Sw[j] += (float)wq[(size_t)k * Cout + j];
-    for (size_t i = 0; i < M; ++i) {
-        float* yo = output + i * Cout;
-        const int32_t* gi = i32.data() + i * Cout;
-        for (int j = 0; j < Cout; ++j) {
-            float v = (float)gi[j] * sa * wscale[j];
-            if (bias) v += bias[j];
-            v -= sa * wscale[j] * (float)ZP * Sw[j];   /* 零点偏置校正 */
-            if (act == 1 && v < 0.0f) v = 0.0f;
-            yo[j] = v;
-        }
+    /* 3)+4) INT8 GEMM + epilogue 融合 (对标 MNN store fusion):
+     *    内积 i32[j] = Σ_k x_q[k]·w_q[k,j]; 反量化真实值
+     *      = i32[j]·(s_a·s_w[j]) + (bias[j] − s_a·s_w[j]·zp·Sw[j]), 再可选 ReLU。
+     *    Sw[j]=Σ_k w_q[k,j], −zp·Sw[j] 为零点偏置校正。
+     *    把 alpha[j]=s_a·s_w[j]、beta[j]=bias[j]−alpha[j]·zp·Sw[j] 预先算好, 由
+     *    acfun_gemm_int8_epi 在 GEMM 微内核写回阶段就地完成「×alpha + beta + ReLU」,
+     *    直接写 float output —— 彻底消除原先的 int32[M·Cout] 中间缓冲与独立一遍
+     *    「读 int32 → 反量化 → 写 float」全张量扫描 (省一次完整内存往返)。 */
+    std::vector<float> alpha(Cout), beta(Cout);
+    for (int j = 0; j < Cout; ++j) {
+        float Swj = 0.0f;
+        for (int k = 0; k < K; ++k) Swj += (float)wq[(size_t)k * Cout + j];
+        float a = sa * wscale[j];
+        alpha[j] = a;
+        beta[j]  = (bias ? bias[j] : 0.0f) - a * (float)ZP * Swj;
     }
+    acfun_gemm_int8_epi((int)M, Cout, K, Aptr, wq, output, alpha.data(), beta.data(), act);
 }

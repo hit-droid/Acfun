@@ -51,11 +51,24 @@ static const int UU = 2;   /* K 展开 */
 static const int UC = 4;   /* 列展开: 同时算 UC 个 4 列块 */
 static const int GB = 4;   /* 行组: 同时算 GB 个 4 行块 (B 随之跨行复用) */
 
+/* epilogue 融合描述符 (对标 MNN store fusion): 非 NULL 时把 int32 累加结果就地反量化
+ * (×alpha[j] + beta[j], alpha=激活scale×权重scale, beta=含零点校正的有效偏置) 并可选 ReLU,
+ * 直接写 float 输出 Cbase, 消除「GEMM 写 int32 中间缓冲 -> 独立一遍全张量反量化扫描」。
+ * NULL 时保持原 int32 写回路径 (acfun_gemm_int8 零回归)。alpha/beta/Cbase 在 run_block 层
+ * 按 (n0,m0) 偏移调整到当前瓦片, 长度 N、步长 ldc 均与 int32 路径一致。 */
+struct Int8Epi {
+    const float* alpha;   /* [nc], 已偏移 +n0 */
+    const float* beta;    /* [nc], 已偏移 +n0 */
+    float*       Cbase;   /* float 输出, 已偏移 +(m0*ldc+n0) */
+    int          act;     /* 1 = 融合 ReLU */
+};
+
 /* 微内核: 处理 (m0,m0+mc) × (n0,n0+nc) 块, K 按 4 分组且 Kg 已对齐为 UU 的倍数。
  * 块布局 (blk*Kg + kg): 同一 blk 的连续 kg 相邻, 利于 K 展开连续流式读取。
  * mc/nc 仅用于约束有效行/列与循环边界。返回写入 Cbase[ib+i, jb+j] (ldc 行步长)。 */
 static inline void kernel_int8(const uint8_t* Ap, const int8_t* Bp, int32_t* Cbase, int ldc,
-                              int mc, int nc, int Kg, int MCblk, int NCblk) {
+                              int mc, int nc, int Kg, int MCblk, int NCblk,
+                              const Int8Epi* epi) {
     (void)MCblk; (void)NCblk;
     for (int jb = 0; jb < nc; jb += NR * UC) {
         int jbR = std::min(NR * UC, nc - jb);   /* 本组实际列数 */
@@ -86,7 +99,10 @@ static inline void kernel_int8(const uint8_t* Ap, const int8_t* Bp, int32_t* Cba
                             acc[g][c] = _mm512_dpbusd_epi32(acc[g][c], a[k], b[c][k]);
                 }
             }
-            /* 写回: 各 (行块, 列块) 的 4×4 块按有效行/列约束 scatter 到 C */
+            /* 写回: 各 (行块, 列块) 的 4×4 块按有效行/列约束 scatter 到 C。
+             * epi==NULL: 原路径, int32 直写 (acfun_gemm_int8 零回归)。
+             * epi!=NULL: 融合 epilogue —— acc(int32)→float, ×alpha[col]+beta[col], 可选
+             *            无分支 ReLU(vmax), scatter 写 float。省去独立反量化扫描遍。 */
             for (int g = 0; g < gR; ++g) {
                 int rb = rbG + g;
                 for (int c = 0; c < cR; ++c) {
@@ -94,10 +110,36 @@ static inline void kernel_int8(const uint8_t* Ap, const int8_t* Bp, int32_t* Cba
                     int jR = std::min(NR, nc - jcol);
                     int32_t tmp[16];
                     _mm512_storeu_si512((__m512i*)tmp, acc[g][c]);
-                    for (int L = 0; L < 16; ++L) {
-                        int i = L >> 2, j = L & 3;
-                        if (ib + g * MR + i < mc && j < jR)
-                            Cbase[((size_t)(ib + g * MR + i)) * ldc + (jcol + j)] = tmp[L];
+                    if (epi) {
+                        /* 4×4 块: lane L 的 (i=L>>2, j=L&3)。4 列 alpha/beta 按 lane 复制:
+                         * 每行的 4 个 lane 对应同一组列 jcol+0..3。用 gather 取 alpha/beta。 */
+                        static const int LANE_COL[16] = {0,1,2,3, 0,1,2,3, 0,1,2,3, 0,1,2,3};
+                        /* 尾部列块 jR<4 时把越界 lane 索引钳到 jR-1(>=0), 避免 gather 读越界;
+                         * 这些 lane 在下方 scatter 时被 `j<jR` 过滤, 值不参与写回。 */
+                        __m512i vcol = _mm512_min_epi32(
+                            _mm512_loadu_si512((const __m512i*)LANE_COL),
+                            _mm512_set1_epi32(jR - 1));
+                        __m512 valpha = _mm512_i32gather_ps(vcol, epi->alpha + jcol, 4);
+                        __m512 vbeta  = _mm512_i32gather_ps(vcol, epi->beta  + jcol, 4);
+                        /* 显式 mul 后 add (非 FMA): 与标量参考 (float)acc*alpha+beta 的舍入
+                         * 顺序严格一致, 保证 SIMD 与标量/非融合逐元素 max|Δ|=0。 */
+                        __m512 vf = _mm512_add_ps(
+                            _mm512_mul_ps(_mm512_cvtepi32_ps(acc[g][c]), valpha), vbeta);
+                        if (epi->act)
+                            vf = _mm512_max_ps(vf, _mm512_setzero_ps());  /* 无分支 ReLU */
+                        float ftmp[16];
+                        _mm512_storeu_ps(ftmp, vf);
+                        for (int L = 0; L < 16; ++L) {
+                            int i = L >> 2, j = L & 3;
+                            if (ib + g * MR + i < mc && j < jR)
+                                epi->Cbase[((size_t)(ib + g * MR + i)) * ldc + (jcol + j)] = ftmp[L];
+                        }
+                    } else {
+                        for (int L = 0; L < 16; ++L) {
+                            int i = L >> 2, j = L & 3;
+                            if (ib + g * MR + i < mc && j < jR)
+                                Cbase[((size_t)(ib + g * MR + i)) * ldc + (jcol + j)] = tmp[L];
+                        }
                     }
                 }
             }
@@ -183,29 +225,53 @@ static inline void packB_int8(int8_t* Bp, const int8_t* B, int n0, int nc, int K
 static inline void run_block_int8(int m0, int n0, int M, int N, int K,
                                   const uint8_t* A, const int8_t* B, int32_t* C,
                                   int MC, int NC, int Kup, int MCblk, int NCblk,
-                                  const uint8_t* Ap_mid, const int8_t* Bp_nid) {
+                                  const uint8_t* Ap_mid, const int8_t* Bp_nid,
+                                  const Int8Epi* epi) {
     int mc = std::min(MC, M - m0);
     int nc = std::min(NC, N - n0);
-    kernel_int8(Ap_mid, Bp_nid, C + (size_t)m0 * N + n0, N, mc, nc, Kup / KG, MCblk, NCblk);
+    Int8Epi local;
+    const Int8Epi* ep = nullptr;
+    if (epi) {
+        /* 把 epilogue 描述符偏移到当前瓦片: alpha/beta 偏 +n0, Cbase 偏 +(m0*N+n0) */
+        local.alpha = epi->alpha + n0;
+        local.beta  = epi->beta  + n0;
+        local.Cbase = epi->Cbase + (size_t)m0 * N + n0;
+        local.act   = epi->act;
+        ep = &local;
+    }
+    kernel_int8(Ap_mid, Bp_nid, C + (size_t)m0 * N + n0, N, mc, nc, Kup / KG, MCblk, NCblk, ep);
 }
 
 /* 串行流水分块 (零 OpenMP 开销): 固定步长 MCblk/NCblk 同时用于打包与内核。 */
 static void gemm_mblock_int8_stream(int m0, int M, int N, int K,
                                     const uint8_t* A, const int8_t* B, int32_t* C,
                                     int MC, int NC, int Kup, int MCblk, int NCblk,
-                                    uint8_t* Ap, int8_t* Bp) {
+                                    uint8_t* Ap, int8_t* Bp, const Int8Epi* epi) {
     int mc = std::min(MC, M - m0);
     for (int n0 = 0; n0 < N; n0 += NC) {
         int nc = std::min(NC, N - n0);
         /* 固定步长 NCblk 同时用于打包与下方内核索引 (绝不可用实际 nc_blk) */
         packB_int8(Bp, B, n0, nc, K, N, Kup, NCblk);
         /* A 面板已在外部按固定步长 MCblk 打包, 此处内核同样用 MCblk 索引 */
-        kernel_int8(Ap, Bp, C + (size_t)m0 * N + n0, N, mc, nc, Kup / KG, MCblk, NCblk);
+        Int8Epi local;
+        const Int8Epi* ep = nullptr;
+        if (epi) {
+            local.alpha = epi->alpha + n0;
+            local.beta  = epi->beta  + n0;
+            local.Cbase = epi->Cbase + (size_t)m0 * N + n0;
+            local.act   = epi->act;
+            ep = &local;
+        }
+        kernel_int8(Ap, Bp, C + (size_t)m0 * N + n0, N, mc, nc, Kup / KG, MCblk, NCblk, ep);
     }
 }
 
-void acfun_gemm_int8_avx512(int M, int N, int K,
-                            const uint8_t* A, const int8_t* B, int32_t* C) {
+/* 内部核心: 完成分块/打包/派发, epi==NULL 走原 int32 写回, 否则走融合 epilogue 写 float。
+ * 注意 C 始终按 int32_t* 传入 (float 输出时由 wrapper 强转), kernel 内部按 epi 决定最终写入
+ * 的是 epi->Cbase(float*) 还是 C(int32_t*); 两条路径的 C 指针仅作占位, 不会被误用。 */
+static void gemm_int8_core(int M, int N, int K,
+                           const uint8_t* A, const int8_t* B, int32_t* C,
+                           const Int8Epi* epi) {
     if (M <= 0 || N <= 0 || K <= 0) return;
     int KC = 256, NC = 256, MC = 256;
     int nt = acfun_get_num_threads_runtime();
@@ -245,7 +311,7 @@ void acfun_gemm_int8_avx512(int M, int N, int K,
             for (int m0 = 0; m0 < M; m0 += MC) {
                 int mc = std::min(MC, M - m0);
                 packA_int8(Ap, A, m0, mc, K, Kup, MCblk);
-                gemm_mblock_int8_stream(m0, M, N, K, A, B, C, MC, NC, Kup, MCblk, NCblk, Ap, Bp);
+                gemm_mblock_int8_stream(m0, M, N, K, A, B, C, MC, NC, Kup, MCblk, NCblk, Ap, Bp, epi);
             }
         }
         free(Ap); free(Bp);
@@ -288,8 +354,24 @@ void acfun_gemm_int8_avx512(int M, int N, int K,
             int n0 = nid * NC;
             run_block_int8(m0, n0, M, N, K, A, B, C, MC, NC, Kup, MCblk, NCblk,
                            Apool + (size_t)mid * Astride,
-                           Bpool + (size_t)nid * Bstride);
+                           Bpool + (size_t)nid * Bstride, epi);
         }
     }
     free(Apool); free(Bpool);
+}
+
+/* 原入口: 无 epilogue, int32 输出 (零回归) */
+void acfun_gemm_int8_avx512(int M, int N, int K,
+                            const uint8_t* A, const int8_t* B, int32_t* C) {
+    gemm_int8_core(M, N, K, A, B, C, nullptr);
+}
+
+/* 融合 epilogue 入口: 反量化 + 有效偏置 + 可选 ReLU 折叠进写回, 直接写 float。
+ * C 为 float 输出 (强转为 int32_t* 仅作 core 内的占位 Cbase, epi 分支不写它)。 */
+void acfun_gemm_int8_epi_avx512(int M, int N, int K,
+                                const uint8_t* A, const int8_t* B, float* C,
+                                const float* alpha, const float* beta, int act) {
+    if (M <= 0 || N <= 0 || K <= 0) return;
+    Int8Epi epi = { alpha, beta, C, act };
+    gemm_int8_core(M, N, K, A, B, (int32_t*)C, &epi);
 }

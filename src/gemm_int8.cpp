@@ -48,3 +48,28 @@ void acfun_gemm_int8(int M, int N, int K,
     if (b == 1) acfun_gemm_int8_avx512(M, N, K, A, B, C);
     else        acfun_gemm_int8_ref(M, N, K, A, B, C);
 }
+
+/* ---- INT8 GEMM epilogue 融合: 反量化(逐通道 alpha) + 有效偏置(beta) + 可选 ReLU ---- */
+void acfun_gemm_int8_epi_ref(int M, int N, int K,
+                             const uint8_t* A, const int8_t* B, float* C,
+                             const float* alpha, const float* beta, int act) {
+    for (int i = 0; i < M; ++i) {
+        const uint8_t* a = A + (size_t)i * K;
+        float* c = C + (size_t)i * N;
+        for (int j = 0; j < N; ++j) {
+            int32_t acc = 0;
+            for (int k = 0; k < K; ++k) acc += (int32_t)a[k] * (int32_t)B[(size_t)k * N + j];
+            float v = (float)acc * alpha[j] + beta[j];
+            if (act && v < 0.0f) v = 0.0f;
+            c[j] = v;
+        }
+    }
+}
+
+void acfun_gemm_int8_epi(int M, int N, int K,
+                         const uint8_t* A, const int8_t* B, float* C,
+                         const float* alpha, const float* beta, int act) {
+    int b = detect_int8_backend();
+    if (b == 1) acfun_gemm_int8_epi_avx512(M, N, K, A, B, C, alpha, beta, act);
+    else        acfun_gemm_int8_epi_ref(M, N, K, A, B, C, alpha, beta, act);
+}
