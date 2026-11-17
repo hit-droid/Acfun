@@ -996,6 +996,39 @@ static void bench_int8_epi() {
     printf("  * GEMM 本体大的方阵中墙钟加速被 GEMM 噪声掩盖, 窄 N(卷积类)场景收益更清晰。\n");
 }
 
+/* ---------- INT8 卷积激活量化 向量化加速 (v1.6.0) ----------
+ * 对比旧标量 lroundf 循环与派发向量内核 (AVX-512/AVX2) 的吞吐, 并做数值门禁:
+ * 逐元素量化级差异 <=1 (nearest-even vs lround 的 tie)。 */
+static void bench_int8_quantize() {
+    printf("\n=== INT8 卷积激活量化 向量化加速 (v1.6.0) ===\n");
+    struct S { int H, W, Cin; } cfgs[] = {
+        {112,112,16}, {224,224,3}, {56,56,32}, {28,28,64},
+    };
+    float inv_s = 127.0f; int zp = 128;
+    printf("%-14s %12s %12s %10s %12s\n", "H×W×Cin", "标量(ms)", "向量(ms)", "加速", "max|Δq|级");
+    for (auto& c : cfgs) {
+        size_t n = (size_t)c.H * c.W * c.Cin;
+        std::vector<float> in(n);
+        rand_fill(in.data(), n);
+        std::vector<uint8_t> qa(n), qb(n);
+        int reps = 300;
+        double t0 = now();
+        for (int r = 0; r < reps; ++r) acfun_quantize_u8_scalar(in.data(), qa.data(), n, inv_s, zp);
+        double tS = (now() - t0) / reps;
+        t0 = now();
+        for (int r = 0; r < reps; ++r) acfun_quantize_u8(in.data(), qb.data(), n, inv_s, zp);
+        double tV = (now() - t0) / reps;
+        int qdiff = 0;
+        for (size_t i = 0; i < n; ++i) qdiff = std::max(qdiff, std::abs((int)qa[i] - (int)qb[i]));
+        char label[32];
+        snprintf(label, sizeof(label), "%dx%dx%d", c.H, c.W, c.Cin);
+        printf("%-14s %12.4f %12.4f %9.1fx %9d  %s\n",
+               label, tS*1e3, tV*1e3, tS/tV, qdiff, qdiff<=1?"OK":"FAIL");
+    }
+    printf("  * 量化结果以量化级(uint8)比对, 向量 nearest-even 与标量 lround 仅 tie 差 1 级;\n");
+    printf("  * 反量化已在 v1.5.0 由 GEMM epilogue 融合消除, 此版补齐量化遍的向量化。\n");
+}
+
 /* ---------- 1c) GEMM 融合后处理 (epilogue) 正确性 ----------
  * 以 "acfun_gemm + 独立偏置/ReLU 遍" 作参考, 与融合版 acfun_gemm_epi 严格比对。
  * 覆盖非整除边界尺寸、有无偏置、act=0/1, 验证 bias 仅在归约完成后叠加一次。 */
@@ -1106,6 +1139,7 @@ int main(int argc, char** argv) {
     bench_maxpool();
     bench_conv_bn_relu_composite();
     bench_int8();
+    bench_int8_quantize();
     bench_int8_winograd();
     bench_int8_epi();
     bench_bf16();

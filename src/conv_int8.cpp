@@ -90,13 +90,11 @@ void acfun_conv2d_int8(const float* input, int N_, int H, int W, int Cin,
         return;
     }
 
-    /* 2) 量化输入张量为 uint8 (仅非 Winograd 路径需要)。1x1/s1/p0 时张量本身即 GEMM 左矩阵, 跳过 im2col。 */
+    /* 2) 量化输入张量为 uint8 (仅非 Winograd 路径需要)。v1.6.0: 改用运行时派发的
+     *    AVX-512/AVX2 向量量化内核 (标量兜底), 替代原先逐元素标量 lroundf 循环。
+     *    1x1/s1/p0 时张量本身即 GEMM 左矩阵, 跳过 im2col。 */
     std::vector<uint8_t> inQ(inN);
-    for (size_t i = 0; i < inN; ++i) {
-        int v = (int)std::lroundf(input[i] * inv_s) + ZP;
-        if (v < 0) v = 0; else if (v > 255) v = 255;
-        inQ[i] = (uint8_t)v;
-    }
+    acfun_quantize_u8(input, inQ.data(), inN, inv_s, ZP);
 
     /* 构造 GEMM 左矩阵 A[M, K]: 1x1/s1/p0 零拷贝 (A 直接指向 inQ), 否则 im2col(量化) */
     const uint8_t* Aptr = inQ.data();

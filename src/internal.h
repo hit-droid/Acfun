@@ -146,6 +146,14 @@ void acfun_gemm_int8_epi_avx512(int M, int N, int K,
                                 const uint8_t* A, const int8_t* B, float* C,
                                 const float* alpha, const float* beta, int act);
 
+/* INT8 卷积激活量化 (v1.6.0): O(inN) 逐元素遍, 此前为标量 lroundf 循环, 在大特征图上
+ * 有明显固定开销。派发 AVX-512 (16路)/AVX2 (8路)/标量: out[i]=clamp(round(in[i]*inv_s)+zp,0,255)。
+ * SIMD 用 nearest-even 取整, 与 lround 仅在恰好 .5 的 tie 上差 1 个量化级, 可忽略。 */
+void acfun_quantize_u8(const float* in, uint8_t* out, size_t n, float inv_s, int zp);
+void acfun_quantize_u8_scalar(const float* in, uint8_t* out, size_t n, float inv_s, int zp);
+void acfun_quantize_u8_avx2(const float* in, uint8_t* out, size_t n, float inv_s, int zp);
+void acfun_quantize_u8_avx512(const float* in, uint8_t* out, size_t n, float inv_s, int zp);
+
 /* INT8 Winograd F(2,3) 3x3 卷积 (整数域, 对标 MNN int8 路径): 3x3 / stride1 / pad1,
  * float 输入 (本函数内就地量化, 零点 zp=128), 逐通道 int8 权重。inv_s = 127/max|x|。
  * 由 conv_int8.cpp 在 3x3/s1/p1 且通道>=4 时自动路由, 省去独立的整张输入量化遍。 */

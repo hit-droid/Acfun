@@ -563,6 +563,16 @@ im2col 卷积 / 1×1 卷积此前还额外分配了一块中间 `gemm_out` 缓�
 > - 结论：epilogue 融合不退化、零回归，并以「去中间缓冲 + 去独立扫描」给出确定性的内存与代码路径收益；
 >   墙钟提速在噪声主机上被 GEMM 本体掩盖，属预期内，并非正确性/架构问题。
 
+### 本轮新增：INT8 卷积激活量化向量化（v1.6.0，量化遍 47–77×）
+
+继 v1.5.0 把反量化折叠进 VNNI GEMM 写回后，本版补齐 INT8 卷积路径**最后一段标量逐元素遍**——
+输入量化 `x_q=clamp(round(x·inv_s)+zp)`。新增运行时派发的 AVX-512（16 路 `cvtps` +
+`cvtusepi32` 打包）/ AVX2（8 路）/ 标量三级内核（`src/int8_quantize*.cpp`），替换 `conv_int8.cpp`
+原先的逐元素 `lroundf` 循环。实测量化遍提速 **46.7–77.3×**（inN=15 万–20 万时从 0.18–0.60 ms
+压到 0.002–0.013 ms），量化级逐元素比对 `max|Δq|≤1`（多数为 0）。至此 INT8 卷积的两段前后处理
+（v1.5.0 反量化 epilogue 融合 + v1.6.0 量化向量化）全部脱离标量循环，与 MNN int8 全链路手段对齐；
+其余路径零改动、零回归。细节见 `release_notes_v1.6.0.md`。
+
 ---
 
 ## 与 MNN 的对比（实事求是）
@@ -606,6 +616,11 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   同舍入）+ 无分支 `vmax` 直接写 float，**彻底删去 int32 中间缓冲与独立一遍全张量反量化扫描**；
   INT8 卷积 im2col 路径已接线。跨 25 组尺寸/边界（含 gather 钳位）与标量/非融合严格 `max|Δ|=0`，
   原 `acfun_gemm_int8` 零回归。
+- ✅ **INT8 卷积激活量化向量化（v1.6.0 新增）**：新增 `acfun_quantize_u8`，AVX-512（16 路 `cvtps`+
+  `cvtusepi32`）/ AVX2（8 路）/ 标量三级派发，替换 `conv_int8.cpp` 逐元素标量 `lroundf` 循环；
+  实测量化遍提速 **46.7–77.3×**（inN=15 万–20 万时 0.18–0.60 ms → 0.002–0.013 ms），量化级逐元素
+  `max|Δq|≤1`（多数为 0）。至此 INT8 卷积两段前后处理（v1.5.0 反量化 epilogue + v1.6.0 量化）全部
+  脱离标量循环，与 MNN int8 全链路手段对齐；其余路径零改动、零回归。
 - ✅ 单线程效率：AVX-512 参考主机实测 **~75–90%** 单核 FMA 峰值（EPYC 9754 Zen4c 真实峰值
   ~83 GFLOPS/核），已进入 MNN 同量级单线程效率区间；当前 AVX2 开发沙箱单线程 GEMM ~32 GFLOPS。
 - ✅ **GEMM 多核扩展修复（v0.9.1）**：`acfun_gemm` 默认线程数改取 `acfun_effective_cores()`
@@ -636,8 +651,11 @@ src/gemm_avx512.cpp     AVX-512F+FMA 后端（16×16 微内核，最优 A 打包
 src/gemm_int8.cpp        INT8 GEMM 调度/派发（运行时按 VNNI 能力选择后端）
 src/gemm_int8_avx512.cpp INT8 GEMM AVX-512 VNNI 后端（vpdpbusd 微内核，-mavx512vnni 独立单元）
 src/gemm_bf16_avx512.cpp BF16 GEMM AVX-512 后端（vdpbf16ps 微内核，交错双面板打包 + KC 分块，-mavx512f -mfma -mavx512bf16 独立单元）
+src/int8_quantize.cpp    INT8 激活量化调度器（AVX-512/AVX2/标量派发）+ 标量参考（v1.6.0）
+src/int8_quantize_avx512.cpp INT8 激活量化 AVX-512 后端（16 路 cvtps + cvtusepi32，-mavx512f -mfma -mavx512bw 独立单元）
+src/int8_quantize_avx2.cpp   INT8 激活量化 AVX2 后端（8 路 cvtps + packus，-mavx2 -mfma 独立单元）
 src/autotune.cpp         GEMM / INT8 GEMM 自动调参（候选 (KC,NC) 网格扫描 + 多尺寸无回归门控 + 本地缓存 + 参考表；float 与 INT8 同缓存持久化）
-src/conv_int8.cpp        INT8 量化卷积（im2col+INT8 GEMM + 零点偏置校正 + acfun_quantize_weights）
+src/conv_int8.cpp        INT8 量化卷积（量化向量化 + im2col+INT8 GEMM + epilogue 反量化融合 + acfun_quantize_weights）
 src/winograd.cpp        Winograd F(2,3) 3×3 快速卷积（自动路由，标量兜底 + 运行时派发）
 src/winograd_avx2.cpp   Winograd 累加内层 AVX2+FMA 向量化（-mavx2 -mfma 独立单元）
 src/winograd_avx512.cpp Winograd 累加内层 AVX-512+FMA 向量化（-mavx512f -mfma 独立单元，寄存器驻留累加 + 瓦片并行）
