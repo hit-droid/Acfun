@@ -573,6 +573,19 @@ im2col 卷积 / 1×1 卷积此前还额外分配了一块中间 `gemm_out` 缓�
 （v1.5.0 反量化 epilogue 融合 + v1.6.0 量化向量化）全部脱离标量循环，与 MNN int8 全链路手段对齐；
 其余路径零改动、零回归。细节见 `release_notes_v1.6.0.md`。
 
+### 本轮新增：小 K INT8 直接卷积内核（v1.7.0，修复 0.2×–0.3× 回退）
+
+此前 INT8 卷积在「输入通道极小 / stride>1」等 **K=KH·KW·Cin 很小而 M 很大**的场景（如
+`224²×3→16`、`56²×16→32 k1 s2`）慢于 float 卷积（0.2–0.3×），是全基准唯一成片回退点：
+`im2col` 把输入放大 KH·KW 倍、`packA` 再放大 4 倍，两段固定开销远超点积本身。本版新增
+**小 K 直接卷积内核**（`src/conv_int8_direct*.cpp`）：权重一次预打包为 VNNI「4-k × 16 通道」
+扩展布局跨全部输出像素复用，逐像素用 `vpdpbusd` 一次算 16 通道 × 4 个 k，融合反量化/bias/ReLU
+一遍写 float，彻底跳过 im2col 与 packA；内层 k→(kh,kw,ic) 预解码为查表，消除最热路径的三次整数除法。
+运行时派发 AVX-512 VNNI / 标量，`1x1/s1/p0` 零拷贝场景自动排除（走原 GEMM，零回归）。实测
+`224²×3→16` 从 **10.39 ms（0.2×）降到 ~2.1 ms（1.1×，首次反超 float）**、`56²×16 k1 s2`
+从 0.18 ms（0.3×）降到 ~0.067 ms（0.9×）；隔离回归测试跨 8 组边界与原路径逐元素
+`max|Δ|=0`。细节见 `release_notes_v1.7.0.md`。
+
 ---
 
 ## 与 MNN 的对比（实事求是）
@@ -621,6 +634,12 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   实测量化遍提速 **46.7–77.3×**（inN=15 万–20 万时 0.18–0.60 ms → 0.002–0.013 ms），量化级逐元素
   `max|Δq|≤1`（多数为 0）。至此 INT8 卷积两段前后处理（v1.5.0 反量化 epilogue + v1.6.0 量化）全部
   脱离标量循环，与 MNN int8 全链路手段对齐；其余路径零改动、零回归。
+- ✅ **小 K INT8 直接卷积内核（v1.7.0 新增）**：针对 K=KH·KW·Cin 很小而 M 很大的回退场景
+  （1×1 stride>1、极小 Cin 的 3×3），新增 `acfun_conv2d_int8_direct`，权重预打包为 VNNI
+  「4-k × 16 通道」布局跨像素复用、逐像素 `vpdpbusd` + 查表解码 tap、融合 epilogue 一遍写 float，
+  跳过 im2col/packA 双重放大；AVX-512 VNNI / 标量运行时派发，`1x1/s1/p0` 走原 GEMM 零回归。
+  `224²×3→16` 从 0.2× 回退变为 **1.1× 正收益（10.39→~2.1 ms）**、`56²×16 k1 s2` 从 0.3× 到
+  **0.9×（0.18→~0.067 ms）**；隔离回归跨 8 组边界 `max|Δ|=0` 严格等价，其余路径零回归。
 - ✅ 单线程效率：AVX-512 参考主机实测 **~75–90%** 单核 FMA 峰值（EPYC 9754 Zen4c 真实峰值
   ~83 GFLOPS/核），已进入 MNN 同量级单线程效率区间；当前 AVX2 开发沙箱单线程 GEMM ~32 GFLOPS。
 - ✅ **GEMM 多核扩展修复（v0.9.1）**：`acfun_gemm` 默认线程数改取 `acfun_effective_cores()`
@@ -631,12 +650,13 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
 - ✅ **INT8 GEMM 多核调度对齐（v1.1.0）**：INT8 GEMM 的二维瓦片并行 / 打包循环由 `schedule(dynamic,1)` 改为
   `schedule(static)`，与 float GEMM（v0.9.1 据此修复 8T+ 吞吐反降）同构——消除 dynamic 中央任务队列锁竞争，
   在裸机多核（带宽充裕）与受限容器（配额封顶）下均按连续瓦片带近线性扩展，单线程路径零改动（无回归）。
-- 🚧 差距与路线：移动端 **ARM NEON** 后端（池化 / 卷积）、更细的图优化（算子重排 / 常量折叠 /
-  **Conv→Pool 跨层带流式融合以彻底消去中间张量**）、多尺寸 / 非 1 stride 的 Winograd 变体
-  （F(4,3) 已在 3×3 专用路径启用，可向更宽 stride / 非方阵推广）、INT8 微内核 ILP 与更大 KC 的
-  进一步压榨（当前 INT8 大矩阵受内存带宽饱和限制）。
+- 🚧 差距与路线：移动端 **ARM NEON** 后端（池化 / 卷积 / 量化 / GEMM）、更细的图优化（算子重排 /
+  常量折叠 / **Conv→Pool 跨层带流式融合以彻底消去中间张量**）、多尺寸 / 非 1 stride 的 Winograd 变体
+  （F(4,3) 已在 3×3 专用路径启用，可向更宽 stride / 非方阵推广）、小 K 直接卷积的多线程并行
+  （v1.7.0 直接内核当前单线程，基准场景已足够，可向大 batch 生产路径扩展）、INT8 微内核 ILP 与更大 KC
+  的进一步压榨（当前 INT8 大矩阵受内存带宽饱和限制）。
 
-下一步以在 ARM 端复现对标结果、深化图优化、进一步逼近 MNN 端到端吞吐为主。
+下一步以在 ARM 端复现对标结果、小 K 直接内核多线程化、深化图优化、进一步逼近 MNN 端到端吞吐为主。
 
 ---
 
@@ -655,7 +675,9 @@ src/int8_quantize.cpp    INT8 激活量化调度器（AVX-512/AVX2/标量派发�
 src/int8_quantize_avx512.cpp INT8 激活量化 AVX-512 后端（16 路 cvtps + cvtusepi32，-mavx512f -mfma -mavx512bw 独立单元）
 src/int8_quantize_avx2.cpp   INT8 激活量化 AVX2 后端（8 路 cvtps + packus，-mavx2 -mfma 独立单元）
 src/autotune.cpp         GEMM / INT8 GEMM 自动调参（候选 (KC,NC) 网格扫描 + 多尺寸无回归门控 + 本地缓存 + 参考表；float 与 INT8 同缓存持久化）
-src/conv_int8.cpp        INT8 量化卷积（量化向量化 + im2col+INT8 GEMM + epilogue 反量化融合 + acfun_quantize_weights）
+src/conv_int8.cpp        INT8 量化卷积（量化向量化 + 小 K 直接内核路由 + im2col+INT8 GEMM + epilogue 反量化融合 + acfun_quantize_weights）
+src/conv_int8_direct.cpp     小 K INT8 直接卷积调度器（VNNI/标量派发）+ 标量兜底（v1.7.0）
+src/conv_int8_direct_avx512.cpp 小 K 直接卷积 AVX-512 VNNI 内核（权重预打包 4-k×16 通道 + tap 查表 + 融合 epilogue，-mavx512f -mfma -mavx512vnni 独立单元，v1.7.0）
 src/winograd.cpp        Winograd F(2,3) 3×3 快速卷积（自动路由，标量兜底 + 运行时派发）
 src/winograd_avx2.cpp   Winograd 累加内层 AVX2+FMA 向量化（-mavx2 -mfma 独立单元）
 src/winograd_avx512.cpp Winograd 累加内层 AVX-512+FMA 向量化（-mavx512f -mfma 独立单元，寄存器驻留累加 + 瓦片并行）
@@ -673,6 +695,7 @@ src/benchmark.cpp       正确性 + GEMM/卷积/端到端/融合/FC+ReLU 融合 
 tools/gen_model.py      测试模型生成器
 tools/test_bf16.cpp       BF16 GEMM 独立验证（正确性 + 吞吐 vs float，独立编译运行）
 tools/test_int8_epi.cpp  INT8 GEMM epilogue 融合独立验证（融合 vs 非融合严格 max|Δ|=0，含 gather 钳位边界）
+tools/test_int8_direct.cpp 小 K 直接卷积隔离回归（vs im2col+GEMM 严格 max|Δ|=0，覆盖 1x1/padding/stride/非整除 Cout/batch，v1.7.0）
 ```
 
 ## License

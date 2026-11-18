@@ -91,10 +91,35 @@ void acfun_conv2d_int8(const float* input, int N_, int H, int W, int Cin,
     }
 
     /* 2) 量化输入张量为 uint8 (仅非 Winograd 路径需要)。v1.6.0: 改用运行时派发的
-     *    AVX-512/AVX2 向量量化内核 (标量兜底), 替代原先逐元素标量 lroundf 循环。
-     *    1x1/s1/p0 时张量本身即 GEMM 左矩阵, 跳过 im2col。 */
+     *    AVX-512/AVX2 向量量化内核 (标量兜底), 替代原先逐元素标量 lroundf 循环。 */
     std::vector<uint8_t> inQ(inN);
     acfun_quantize_u8(input, inQ.data(), inN, inv_s, ZP);
+
+    /* 反量化参数: alpha[j]=s_a·s_w[j], beta[j]=bias[j]−alpha[j]·zp·Sw[j]。
+     * Sw[j]=Σ_k w_q[k,j], −zp·Sw[j] 为零点偏置校正。直接内核与 GEMM epilogue 共用。 */
+    std::vector<float> alpha(Cout), beta(Cout);
+    for (int j = 0; j < Cout; ++j) {
+        float Swj = 0.0f;
+        for (int k = 0; k < K; ++k) Swj += (float)wq[(size_t)k * Cout + j];
+        float a = sa * wscale[j];
+        alpha[j] = a;
+        beta[j]  = (bias ? bias[j] : 0.0f) - a * (float)ZP * Swj;
+    }
+
+    /* v1.7.0 小 K 直接卷积路由: K=KH*KW*Cin 很小 (1x1 / 极小 Cin / stride>1) 而
+     * M 很大时, im2col 把输入放大 KH*KW 倍、packA 再放大 4 倍, 固定开销远超点积,
+     * 是 INT8 卷积慢于 float 的回退根因 (224²×3→16 曾 0.2×)。这类场景直接读 NHWC
+     * 量化输入、VNNI 逐像素算点积 + 融合 epilogue, 跳过 im2col 与 packA 两段。
+     * 3x3/s1/p1 且通道足够大的情形已被上方 Winograd 快路径截获, 不进这里。
+     * 1x1/s1/p0 即便 K 小也无 im2col 开销 (A 零拷贝直指 inQ), 原 GEMM 已高效,
+     * 排除以免逐像素直接内核反而回退 (28²×64 k1 实测)。阈值 K<=64 精准覆盖其余
+     * 回退点 (K=16/27), 大 K 仍走原 GEMM 零回归。 */
+    bool zero_copy_1x1 = (KH == 1 && KW == 1 && stride == 1 && pad == 0);
+    if (K <= 64 && !zero_copy_1x1) {
+        acfun_conv2d_int8_direct(inQ.data(), N_, H, W, Cin, wq, alpha.data(), beta.data(),
+                                 KH, KW, Cout, stride, pad, OH, OW, output, act);
+        return;
+    }
 
     /* 构造 GEMM 左矩阵 A[M, K]: 1x1/s1/p0 零拷贝 (A 直接指向 inQ), 否则 im2col(量化) */
     const uint8_t* Aptr = inQ.data();
@@ -108,18 +133,7 @@ void acfun_conv2d_int8(const float* input, int N_, int H, int W, int Cin,
     /* 3)+4) INT8 GEMM + epilogue 融合 (对标 MNN store fusion):
      *    内积 i32[j] = Σ_k x_q[k]·w_q[k,j]; 反量化真实值
      *      = i32[j]·(s_a·s_w[j]) + (bias[j] − s_a·s_w[j]·zp·Sw[j]), 再可选 ReLU。
-     *    Sw[j]=Σ_k w_q[k,j], −zp·Sw[j] 为零点偏置校正。
-     *    把 alpha[j]=s_a·s_w[j]、beta[j]=bias[j]−alpha[j]·zp·Sw[j] 预先算好, 由
-     *    acfun_gemm_int8_epi 在 GEMM 微内核写回阶段就地完成「×alpha + beta + ReLU」,
-     *    直接写 float output —— 彻底消除原先的 int32[M·Cout] 中间缓冲与独立一遍
-     *    「读 int32 → 反量化 → 写 float」全张量扫描 (省一次完整内存往返)。 */
-    std::vector<float> alpha(Cout), beta(Cout);
-    for (int j = 0; j < Cout; ++j) {
-        float Swj = 0.0f;
-        for (int k = 0; k < K; ++k) Swj += (float)wq[(size_t)k * Cout + j];
-        float a = sa * wscale[j];
-        alpha[j] = a;
-        beta[j]  = (bias ? bias[j] : 0.0f) - a * (float)ZP * Swj;
-    }
+     *    把 alpha/beta 由 acfun_gemm_int8_epi 在 GEMM 微内核写回阶段就地完成
+     *    「×alpha + beta + ReLU」, 直接写 float output。 */
     acfun_gemm_int8_epi((int)M, Cout, K, Aptr, wq, output, alpha.data(), beta.data(), act);
 }

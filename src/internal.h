@@ -154,6 +154,29 @@ void acfun_quantize_u8_scalar(const float* in, uint8_t* out, size_t n, float inv
 void acfun_quantize_u8_avx2(const float* in, uint8_t* out, size_t n, float inv_s, int zp);
 void acfun_quantize_u8_avx512(const float* in, uint8_t* out, size_t n, float inv_s, int zp);
 
+/* ---- 小 K INT8 直接卷积 (v1.7.0): 绕过 im2col + GEMM packA 的固定开销 ----
+ * 针对「输入通道小 / 1x1 / stride>1」等 K=KH*KW*Cin 很小而 M 很大的回退场景
+ * (如 224²×3→16、28²×64 1x1), 直接读 NHWC uint8 输入、按输出通道 16 路 VNNI
+ * 累加、融合反量化/bias/ReLU 一遍写 float, 无中间缓冲。输入 inQ [N,H,W,Cin]
+ * 已量化 (零点 zp=128, padding 亦填 zp), wq 为 [K,Cout] int8, alpha/beta 为
+ * 每通道反量化因子/有效偏置 (由 conv_int8.cpp 预先算好, 与 GEMM 路径共用)。
+ * 由 conv_int8.cpp 在小 K 且无 Winograd 快路径时派发。 */
+void acfun_conv2d_int8_direct(const uint8_t* inQ, int N, int H, int W, int Cin,
+                              const int8_t* wq, const float* alpha, const float* beta,
+                              int KH, int KW, int Cout, int stride, int pad,
+                              int OH, int OW, float* output, int act);
+/* 标量兜底 (可移植): 逐像素逐通道标量累加, 数值为直接路径的正确性基线。 */
+void acfun_conv2d_int8_direct_scalar(const uint8_t* inQ, int N, int H, int W, int Cin,
+                                     const int8_t* wq, const float* alpha, const float* beta,
+                                     int KH, int KW, int Cout, int stride, int pad,
+                                     int OH, int OW, float* output, int act);
+/* AVX-512 后端 (编译单元带 -mavx512f -mfma -mavx512vnni): 权重预打包为 4×16
+ * VNNI 扩展布局 (一次, 跨全部输出像素复用), 逐输出像素 16 路通道 dpbusd 累加。 */
+void acfun_conv2d_int8_direct_avx512(const uint8_t* inQ, int N, int H, int W, int Cin,
+                                     const int8_t* wq, const float* alpha, const float* beta,
+                                     int KH, int KW, int Cout, int stride, int pad,
+                                     int OH, int OW, float* output, int act);
+
 /* INT8 Winograd F(2,3) 3x3 卷积 (整数域, 对标 MNN int8 路径): 3x3 / stride1 / pad1,
  * float 输入 (本函数内就地量化, 零点 zp=128), 逐通道 int8 权重。inv_s = 127/max|x|。
  * 由 conv_int8.cpp 在 3x3/s1/p1 且通道>=4 时自动路由, 省去独立的整张输入量化遍。 */

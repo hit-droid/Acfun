@@ -20,6 +20,8 @@ add_library(acfun STATIC
     src/int8_quantize.cpp
     src/int8_quantize_avx2.cpp
     src/int8_quantize_avx512.cpp
+    src/conv_int8_direct.cpp
+    src/conv_int8_direct_avx512.cpp
     src/autotune.cpp
     src/winograd.cpp
     src/winograd_avx2.cpp
@@ -54,6 +56,9 @@ set_source_files_properties(src/gemm_int8_avx512.cpp PROPERTIES COMPILE_FLAGS "-
 # AVX2 用 256-bit 同构路径。运行时由 int8_quantize.cpp 派发。
 set_source_files_properties(src/int8_quantize_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma -mavx512bw")
 set_source_files_properties(src/int8_quantize_avx2.cpp PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
+# 小 K INT8 直接卷积 (v1.7.0): VNNI 后端用 vpdpbusd 一次算 16 通道 × 4 个 k,
+# 权重预打包为 4×16 扩展布局跨像素复用; -ffp-contract=off 保证反量化 mul+add 与标量同序。
+set_source_files_properties(src/conv_int8_direct_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma -mavx512vnni -ffp-contract=off")
 # BF16 GEMM: AVX-512 BF16 的 vdpbf16_ps, 整数/bf16 点积累加到 f32, 带宽仅 float 之半;
 # 仅在检测到 avx512_bf16 时由基准 (bench_bf16) 调用, 否则回落 acfun_gemm。
 set_source_files_properties(src/gemm_bf16_avx512.cpp PROPERTIES COMPILE_FLAGS "-mavx512f -mfma -mavx512bf16")
