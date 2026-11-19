@@ -121,10 +121,19 @@ void acfun_conv2d_int8(const float* input, int N_, int H, int W, int Cin,
         return;
     }
 
-    /* 构造 GEMM 左矩阵 A[M, K]: 1x1/s1/p0 零拷贝 (A 直接指向 inQ), 否则 im2col(量化) */
+    /* v1.8.0: 1x1/s1/p0 走专用 VNNI 逐点内核, 消除通用 GEMM 在小 K 上的 packA/packB
+     * 扩展 4x4 布局 + 三级分块 + 双缓冲 malloc 固定开销 (28²x64 k1 曾 0.4ms vs float 0.1ms)。
+     * A[M,K] 零拷贝连续, 专用内核无 tap 解码 (区别于 v1.7.0 小 K 直接内核), 逐元素
+     * max|Δ|=0 对齐 GEMM epilogue; alpha/beta 共用上一节结果, 数值零回归。 */
+    if (KH == 1 && KW == 1 && stride == 1 && pad == 0) {
+        acfun_conv1x1_int8(inQ.data(), (int)M, K, Cout, wq, alpha.data(), beta.data(), output, act);
+        return;
+    }
+
+    /* 构造 GEMM 左矩阵 A[M, K]: 非 1x1 走 im2col(量化) */
     const uint8_t* Aptr = inQ.data();
     std::vector<uint8_t> Aq;
-    if (!(KH == 1 && KW == 1 && stride == 1 && pad == 0)) {
+    {
         Aq.resize(M * K);
         im2col_u8(inQ.data(), H, W, Cin, KH, KW, stride, pad, OH, OW, Aq.data());
         Aptr = Aq.data();

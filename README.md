@@ -586,6 +586,20 @@ im2col 卷积 / 1×1 卷积此前还额外分配了一块中间 `gemm_out` 缓�
 从 0.18 ms（0.3×）降到 ~0.067 ms（0.9×）；隔离回归测试跨 8 组边界与原路径逐元素
 `max|Δ|=0`。细节见 `release_notes_v1.7.0.md`。
 
+### 本轮新增：1×1 INT8 逐点卷积专用内核（v1.8.0，修复最后一片 0.3× 回退）
+
+至此全基准唯一残留的 INT8 回退点是 `28²×64→64 k1 s1`（长期 0.3×）。逐阶段剖析定位根因：
+量化遍仅 0.0018 ms，而通用 `acfun_gemm_int8_epi` 独占 0.396 ms（93%）——K=64 极小矩阵的
+扩展 4×4 packA/packB + 三级分块 + 双缓冲 malloc + epilogue gather/scatter 固定开销远超点积。
+v1.7.0 小 K 直接内核虽能绕过打包，但其为 3×3 设计的 tap 解码（每 tap 3 次数组访问 + 边界判断 +
+逐字节移位）在 1×1 上纯属冗余，实测反致 0.71 ms 回退，故当时排除。本版新增 **1×1 专用 VNNI
+逐点内核**（`src/conv1x1_int8*.cpp`）：A `[M,K]` 零拷贝、每行连续 4 字节一次 load + 广播（无
+im2col/packA/tap 解码），权重预打包「4-k × 16 通道」跨全部 M 行复用、CB 个 int32 累加器跨 k
+常驻，一条 `vpdpbusd` 算完 16 通道 × 4 个 k；融合 epilogue 用 16 通道掩码 load/store 消除
+gather + 逐 lane scatter，并按行多线程并行。`28²×64 k1` 从 **0.403 ms（0.3×）降到 0.097 ms
+（1.2×，首次反超 float）**，隔离测试 10 组（含非整除 Cout、nt=1/4）逐元素 `max|Δ|=0`，
+其余路径零回归。细节见 `release_notes_v1.8.0.md`。
+
 ---
 
 ## 与 MNN 的对比（实事求是）
@@ -640,6 +654,13 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   跳过 im2col/packA 双重放大；AVX-512 VNNI / 标量运行时派发，`1x1/s1/p0` 走原 GEMM 零回归。
   `224²×3→16` 从 0.2× 回退变为 **1.1× 正收益（10.39→~2.1 ms）**、`56²×16 k1 s2` 从 0.3× 到
   **0.9×（0.18→~0.067 ms）**；隔离回归跨 8 组边界 `max|Δ|=0` 严格等价，其余路径零回归。
+- ✅ **1×1 INT8 逐点卷积专用内核（v1.8.0 新增）**：攻下全基准最后一片回退点 `28²×64→64 k1 s1`
+  （长期 0.3×）。逐阶段剖析定位根因为通用 `acfun_gemm_int8_epi` 在小 K=64 上 packA/packB +
+  三级分块 + 双缓冲固定开销独占 0.396 ms（93%，量化遍仅 0.0018 ms）。新增 `acfun_conv1x1_int8`：
+  A 行连续 4 字节一次加载 + 广播（**无 v1.7.0 小 K 内核在 1×1 上致回退的 tap 解码**）、权重预打包
+  「4-k × 16 通道」跨 M 行复用、累加器跨 k 驻留、融合 epilogue 掩码 load/store（消除 gather +
+  逐 lane scatter），支持按行多线程。`28²×64 k1` 从 0.403 ms 降到 **0.097 ms（0.3× → 1.2×，
+  首次反超 float）**；隔离测试 10 组（含非整除 Cout、nt=1/4）逐元素 `max|Δ|=0`，其余路径零回归。
 - ✅ 单线程效率：AVX-512 参考主机实测 **~75–90%** 单核 FMA 峰值（EPYC 9754 Zen4c 真实峰值
   ~83 GFLOPS/核），已进入 MNN 同量级单线程效率区间；当前 AVX2 开发沙箱单线程 GEMM ~32 GFLOPS。
 - ✅ **GEMM 多核扩展修复（v0.9.1）**：`acfun_gemm` 默认线程数改取 `acfun_effective_cores()`
@@ -653,10 +674,10 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
 - 🚧 差距与路线：移动端 **ARM NEON** 后端（池化 / 卷积 / 量化 / GEMM）、更细的图优化（算子重排 /
   常量折叠 / **Conv→Pool 跨层带流式融合以彻底消去中间张量**）、多尺寸 / 非 1 stride 的 Winograd 变体
   （F(4,3) 已在 3×3 专用路径启用，可向更宽 stride / 非方阵推广）、小 K 直接卷积的多线程并行
-  （v1.7.0 直接内核当前单线程，基准场景已足够，可向大 batch 生产路径扩展）、INT8 微内核 ILP 与更大 KC
+  （v1.7.0 直接内核当前单线程，基准场景已足够；可复用 v1.8.0 1×1 内核的连续 A 加载思想扩展至 3×3 小 Cin）、INT8 微内核 ILP 与更大 KC
   的进一步压榨（当前 INT8 大矩阵受内存带宽饱和限制）。
 
-下一步以在 ARM 端复现对标结果、小 K 直接内核多线程化、深化图优化、进一步逼近 MNN 端到端吞吐为主。
+下一步以在 ARM 端复现对标结果、小 K 直接内核多线程化（复用 v1.8.0 1×1 专用内核范式）、深化图优化、进一步逼近 MNN 端到端吞吐为主。
 
 ---
 
@@ -675,7 +696,9 @@ src/int8_quantize.cpp    INT8 激活量化调度器（AVX-512/AVX2/标量派发�
 src/int8_quantize_avx512.cpp INT8 激活量化 AVX-512 后端（16 路 cvtps + cvtusepi32，-mavx512f -mfma -mavx512bw 独立单元）
 src/int8_quantize_avx2.cpp   INT8 激活量化 AVX2 后端（8 路 cvtps + packus，-mavx2 -mfma 独立单元）
 src/autotune.cpp         GEMM / INT8 GEMM 自动调参（候选 (KC,NC) 网格扫描 + 多尺寸无回归门控 + 本地缓存 + 参考表；float 与 INT8 同缓存持久化）
-src/conv_int8.cpp        INT8 量化卷积（量化向量化 + 小 K 直接内核路由 + im2col+INT8 GEMM + epilogue 反量化融合 + acfun_quantize_weights）
+src/conv_int8.cpp        INT8 量化卷积（量化向量化 + 1x1 专用内核路由 + 小 K 直接内核路由 + im2col+INT8 GEMM + epilogue 反量化融合 + acfun_quantize_weights）
+src/conv1x1_int8.cpp     1x1 INT8 逐点卷积调度器（VNNI/标量派发）+ 标量兜底（v1.8.0）
+src/conv1x1_int8_avx512.cpp 1x1 INT8 专用 AVX-512 VNNI 内核（A 零拷贝连续加载 + 权重预打包 4-k×16 通道跨行复用 + 累加器驻留 + 掩码 epilogue + 多线程，-mavx512f -mfma -mavx512vnni 独立单元，v1.8.0）
 src/conv_int8_direct.cpp     小 K INT8 直接卷积调度器（VNNI/标量派发）+ 标量兜底（v1.7.0）
 src/conv_int8_direct_avx512.cpp 小 K 直接卷积 AVX-512 VNNI 内核（权重预打包 4-k×16 通道 + tap 查表 + 融合 epilogue，-mavx512f -mfma -mavx512vnni 独立单元，v1.7.0）
 src/winograd.cpp        Winograd F(2,3) 3×3 快速卷积（自动路由，标量兜底 + 运行时派发）
@@ -696,6 +719,7 @@ tools/gen_model.py      测试模型生成器
 tools/test_bf16.cpp       BF16 GEMM 独立验证（正确性 + 吞吐 vs float，独立编译运行）
 tools/test_int8_epi.cpp  INT8 GEMM epilogue 融合独立验证（融合 vs 非融合严格 max|Δ|=0，含 gather 钳位边界）
 tools/test_int8_direct.cpp 小 K 直接卷积隔离回归（vs im2col+GEMM 严格 max|Δ|=0，覆盖 1x1/padding/stride/非整除 Cout/batch，v1.7.0）
+tools/test_conv1x1.cpp   1x1 INT8 专用内核隔离回归（vs 通用 GEMM epilogue 严格 max|Δ|=0，覆盖非整除 Cout/act/nt=1,4，v1.8.0）
 ```
 
 ## License

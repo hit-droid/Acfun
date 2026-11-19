@@ -177,6 +177,21 @@ void acfun_conv2d_int8_direct_avx512(const uint8_t* inQ, int N, int H, int W, in
                                      int KH, int KW, int Cout, int stride, int pad,
                                      int OH, int OW, float* output, int act);
 
+/* ---- 1x1 INT8 逐点卷积专用内核 (v1.8.0): 消除通用 GEMM 在小 K 上的打包/分块开销 ----
+ * 1x1/stride1/pad0 的 A[M,K] 零拷贝连续 (K=Cin), 直接 VNNI 点积 + 融合 epilogue,
+ * 无 im2col / packA / tap 解码。acc = Σ_k inQ·wq (k 升序), out = acc·alpha+beta (+ReLU),
+ * 与 acfun_gemm_int8_epi 逐元素 max|Δ|=0。alpha/beta 由 conv_int8.cpp 预好共用。
+ * 标量版为可移植兜底; AVX-512 VNNI 版权重预打包 4k×16ch 跨行复用、按行多线程。 */
+void acfun_conv1x1_int8(const uint8_t* inQ, int M, int K, int Cout,
+                        const int8_t* wq, const float* alpha, const float* beta,
+                        float* output, int act);
+void acfun_conv1x1_int8_scalar(const uint8_t* inQ, int M, int K, int Cout,
+                               const int8_t* wq, const float* alpha, const float* beta,
+                               float* output, int act);
+void acfun_conv1x1_int8_avx512(const uint8_t* inQ, int M, int K, int Cout,
+                               const int8_t* wq, const float* alpha, const float* beta,
+                               float* output, int act);
+
 /* INT8 Winograd F(2,3) 3x3 卷积 (整数域, 对标 MNN int8 路径): 3x3 / stride1 / pad1,
  * float 输入 (本函数内就地量化, 零点 zp=128), 逐通道 int8 权重。inv_s = 127/max|x|。
  * 由 conv_int8.cpp 在 3x3/s1/p1 且通道>=4 时自动路由, 省去独立的整张输入量化遍。 */

@@ -1029,6 +1029,48 @@ static void bench_int8_quantize() {
     printf("  * 反量化已在 v1.5.0 由 GEMM epilogue 融合消除, 此版补齐量化遍的向量化。\n");
 }
 
+/* ---------- 6b) 1x1 INT8 逐点卷积专用内核 (v1.8.0) ----------
+ * 1x1/s1/p0 卷积 = A[M,K]×B[K,N] GEMM。专用内核零拷贝连续 A + 权重预打包跨行复用 +
+ * 融合 epilogue, 消除通用 INT8 GEMM 在小 K 上的 packA/packB + 双缓冲固定开销。
+ * 参考 = acfun_gemm_int8_epi (原路径), 二者须逐元素 max|Δ|=0。 */
+static void bench_int8_1x1() {
+    printf("\n=== 1x1 INT8 逐点卷积专用内核 (v1.8.0) vs 通用 GEMM ===\n");
+    struct C { int M, K, N, act; } cfgs[] = {
+        {784,64,64,0}, {784,64,64,1}, {3136,32,32,1}, {196,64,32,0},
+        {50176,64,16,1}, {1000,128,48,1},
+    };
+    acfun_set_threads(1); acfun_set_num_threads_runtime(1);
+    int fails = 0;
+    printf("%9s %5s %5s %4s %14s %14s %9s %12s\n",
+           "M", "K", "N", "act", "通用GEMM(ms)", "1x1专用(ms)", "加速", "max|Δ|");
+    for (auto& c : cfgs) {
+        std::vector<uint8_t> A((size_t)c.M * c.K);
+        std::vector<int8_t>  B((size_t)c.K * c.N);
+        std::vector<float> alpha(c.N), beta(c.N);
+        std::vector<float> Cref((size_t)c.M * c.N), Cnew((size_t)c.M * c.N);
+        unsigned sd = (unsigned)(c.M * 131 + c.K * 17 + c.N);
+        for (size_t i = 0; i < A.size(); ++i) A[i] = (uint8_t)((sd++ * 2654435761u) >> 24);
+        for (size_t i = 0; i < B.size(); ++i) B[i] = (int8_t)(((sd++ * 1103515245u) >> 24) - 128);
+        for (int j = 0; j < c.N; ++j) { alpha[j] = 0.001f + 0.0001f * (j % 13); beta[j] = -0.5f + 0.01f * (j % 7); }
+        acfun_gemm_int8_epi(c.M, c.N, c.K, A.data(), B.data(), Cref.data(), alpha.data(), beta.data(), c.act);
+        acfun_conv1x1_int8(A.data(), c.M, c.K, c.N, B.data(), alpha.data(), beta.data(), Cnew.data(), c.act);
+        float md = 0;
+        for (size_t i = 0; i < Cref.size(); ++i) md = std::max(md, std::fabs(Cref[i] - Cnew[i]));
+        bool ok = (md == 0.0f);
+        if (!ok) ++fails;
+        int reps = (c.M * c.N > (1u << 20)) ? 20 : 100;
+        double t0 = now();
+        for (int r = 0; r < reps; ++r) acfun_gemm_int8_epi(c.M, c.N, c.K, A.data(), B.data(), Cref.data(), alpha.data(), beta.data(), c.act);
+        double tG = (now() - t0) / reps;
+        t0 = now();
+        for (int r = 0; r < reps; ++r) acfun_conv1x1_int8(A.data(), c.M, c.K, c.N, B.data(), alpha.data(), beta.data(), Cnew.data(), c.act);
+        double tC = (now() - t0) / reps;
+        printf("%9d %5d %5d %4d %14.4f %14.4f %8.2fx %9.3e %s\n",
+               c.M, c.K, c.N, c.act, tG * 1e3, tC * 1e3, tG / tC, md, ok ? "OK" : "FAIL");
+    }
+    printf("  1x1 INT8 专用内核 %s\n", fails == 0 ? "全部通过" : "存在失败");
+}
+
 /* ---------- 1c) GEMM 融合后处理 (epilogue) 正确性 ----------
  * 以 "acfun_gemm + 独立偏置/ReLU 遍" 作参考, 与融合版 acfun_gemm_epi 严格比对。
  * 覆盖非整除边界尺寸、有无偏置、act=0/1, 验证 bias 仅在归约完成后叠加一次。 */
@@ -1140,6 +1182,7 @@ int main(int argc, char** argv) {
     bench_conv_bn_relu_composite();
     bench_int8();
     bench_int8_quantize();
+    bench_int8_1x1();
     bench_int8_winograd();
     bench_int8_epi();
     bench_bf16();
