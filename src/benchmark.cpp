@@ -785,8 +785,9 @@ static void bench_int8() {
     }
     printf("  * INT8 算力 = uint8×int8 MAC × 16/指令, 带宽仅 1/4; GOPS 为同口径 (2·M·N·K/t) 吞吐\n");
 
-    /* INT8 卷积: 端到端提速 + 精度 */
+    /* INT8 卷积: 端到端提速 + 精度 (v1.9.0: 并列 1T 与 MT, 展示小 K 直接内核多线程收益) */
     printf("\n=== INT8 量化卷积 (AVX-512 VNNI) vs float 卷积 ===\n");
+    printf("  MT=%d 线程; float 走 Winograd(内部按可用核并行), INT8-MT 用于公平对比\n", mt_threads);
     struct CC { int H, W, Cin, Cout, KH, KW, st, pd; } cfgs[] = {
         {112,112,16,16,3,3,1,1}, {56,56,32,32,3,3,1,1}, {28,28,64,64,1,1,1,0},
         {56,56,16,32,1,1,2,0}, {224,224,3,16,3,3,1,1},
@@ -800,15 +801,23 @@ static void bench_int8() {
         std::vector<float> ws(Cout); std::vector<int8_t> wq(wN);
         acfun_quantize_weights(w.data(), KH*KW*Cin, Cout, ws.data(), wq.data());
         int reps = (outN > (1u<<24)) ? 5 : 20;
-        acfun_set_threads(1); acfun_set_num_threads_runtime(1);
+        /* float 对照: Winograd 内部按 effective_cores 多线程; 此处不干扰其调度 */
+        acfun_set_threads(1);
         double t0=now(); for(int r=0;r<reps;++r) acfun_conv2d(in.data(),N,H,W,Cin,w.data(),b.data(),KH,KW,Cout,st,pd,of.data());
         double tf=(now()-t0)/reps;
+        /* INT8 单线程 (v1.7/v1.8 基线) */
+        acfun_set_num_threads_runtime(1);
         t0=now(); for(int r=0;r<reps;++r) acfun_conv2d_int8(in.data(),N,H,W,Cin,wq.data(),ws.data(),b.data(),KH,KW,Cout,st,pd,0.0f,oi.data(),0);
-        double ti=(now()-t0)/reps;
+        double ti1=(now()-t0)/reps;
+        /* INT8 多线程 (v1.9.0 小 K 直接内核 / 1x1 内核并行) */
+        acfun_set_num_threads_runtime(mt_threads);
+        t0=now(); for(int r=0;r<reps;++r) acfun_conv2d_int8(in.data(),N,H,W,Cin,wq.data(),ws.data(),b.data(),KH,KW,Cout,st,pd,0.0f,oi.data(),0);
+        double tiMT=(now()-t0)/reps;
         float maxd=0; for(size_t i=0;i<outN;++i) maxd=std::max(maxd, std::fabs(of[i]-oi[i]));
-        printf("  %dx%dx%d->%d k%d s%d  FP:%7.3fms(%6.1f/s)  INT8:%7.3fms(%6.1f/s)  加速%.1fx  max|Δ|=%9.3e\n",
-               H,W,Cin,Cout,KH,st, tf*1e3,1.0/tf, ti*1e3,1.0/ti, tf/ti, maxd);
+        printf("  %dx%dx%d->%d k%d s%d  FP:%7.3f  INT8-1T:%7.3f  INT8-MT:%7.3fms  MT加速%.2fx  加速%.1fx  max|Δ|=%9.3e\n",
+               H,W,Cin,Cout,KH,st, tf*1e3, ti1*1e3, tiMT*1e3, ti1/tiMT, tf/tiMT, maxd);
     }
+    printf("  * INT8-MT 为多线程口径 (与 float 公平对比); 小图工作感知回落串行时 MT 加速≈1.0x\n");
     printf("  * 精度损失来自逐张量激活量化 (随机权重最坏情形); 真实模型(BN/ReLU)通常 <1%%\n");
 }
 

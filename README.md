@@ -600,6 +600,18 @@ gather + 逐 lane scatter，并按行多线程并行。`28²×64 k1` 从 **0.403
 （1.2×，首次反超 float）**，隔离测试 10 组（含非整除 Cout、nt=1/4）逐元素 `max|Δ|=0`，
 其余路径零回归。细节见 `release_notes_v1.8.0.md`。
 
+### 本轮新增：小 K INT8 直接卷积多线程并行（v1.9.0，224²×3 大 M 场景 2.53×、反超 float 1.8×）
+
+v1.7.0 的小 K 直接卷积内核（`acfun_conv2d_int8_direct`）逐输出像素**完全串行**，在
+`224²×3→16 k3 s1`（Cin=3<4 不满足 Winograd 门槛，K=27、M=50176）这一全基准最大的
+第一层卷积上长期停留 ~1.0×——而对照的 float 卷积走 Winograd 已按 4 核配额并行。本版
+按 README「下一步」把该内核改为**按输出行 (n,oh) 展平的 OpenMP 静态并行**：各行输出区
+互不相交、权重预打包 `Bp` / tap 表 / `alpha` / `beta` 只读共享、累加器栈上私有，零写冲突、
+结果与线程数严格无关；工作感知在行数不足或输出过小时回落串行（小图零回退）。实测
+`224²×3→16` INT8 从单线程 **2.826 ms 降到多线程 1.118 ms（2.53×）**，相对 float 由
+**~1.0× 反超到 1.8×**；隔离测试跨 8 组边界 1T/4T 逐元素 **max|Δ|=0**，全基准正确性全过，
+其余路径零改动。细节见 `release_notes_v1.9.0.md`。
+
 ---
 
 ## 与 MNN 的对比（实事求是）
@@ -661,6 +673,11 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   「4-k × 16 通道」跨 M 行复用、累加器跨 k 驻留、融合 epilogue 掩码 load/store（消除 gather +
   逐 lane scatter），支持按行多线程。`28²×64 k1` 从 0.403 ms 降到 **0.097 ms（0.3× → 1.2×，
   首次反超 float）**；隔离测试 10 组（含非整除 Cout、nt=1/4）逐元素 `max|Δ|=0`，其余路径零回归。
+- ✅ **小 K 直接卷积多线程并行（v1.9.0 新增）**：把 v1.7.0 小 K INT8 直接内核由逐像素串行改为
+  **按输出行 (n,oh) 展平的 OpenMP 静态并行**——各行输出区互不相交、`Bp`/tap 表/`alpha`/`beta`
+  只读共享、累加器栈上私有，零写冲突、结果与线程数严格无关；工作感知在小图回落串行。`224²×3→16`
+  大 M 场景 INT8 单线程 2.826 ms → 多线程 **1.118 ms（2.53×）**，相对 float 由 ~1.0× **反超到 1.8×**；
+  隔离测试跨 8 组边界 1T/4T 逐元素 `max|Δ|=0`，其余路径零改动。
 - ✅ 单线程效率：AVX-512 参考主机实测 **~75–90%** 单核 FMA 峰值（EPYC 9754 Zen4c 真实峰值
   ~83 GFLOPS/核），已进入 MNN 同量级单线程效率区间；当前 AVX2 开发沙箱单线程 GEMM ~32 GFLOPS。
 - ✅ **GEMM 多核扩展修复（v0.9.1）**：`acfun_gemm` 默认线程数改取 `acfun_effective_cores()`
@@ -673,11 +690,11 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   在裸机多核（带宽充裕）与受限容器（配额封顶）下均按连续瓦片带近线性扩展，单线程路径零改动（无回归）。
 - 🚧 差距与路线：移动端 **ARM NEON** 后端（池化 / 卷积 / 量化 / GEMM）、更细的图优化（算子重排 /
   常量折叠 / **Conv→Pool 跨层带流式融合以彻底消去中间张量**）、多尺寸 / 非 1 stride 的 Winograd 变体
-  （F(4,3) 已在 3×3 专用路径启用，可向更宽 stride / 非方阵推广）、小 K 直接卷积的多线程并行
-  （v1.7.0 直接内核当前单线程，基准场景已足够；可复用 v1.8.0 1×1 内核的连续 A 加载思想扩展至 3×3 小 Cin）、INT8 微内核 ILP 与更大 KC
-  的进一步压榨（当前 INT8 大矩阵受内存带宽饱和限制）。
+  （F(4,3) 已在 3×3 专用路径启用，可向更宽 stride / 非方阵推广）、小 K 直接内核的 tap 解码消除
+  （复用 v1.8.0 1×1 内核的连续 A 加载思想扩展至 3×3 小 Cin；多线程并行已于 v1.9.0 完成）、
+  INT8 微内核 ILP 与更大 KC 的进一步压榨（当前 INT8 大矩阵受内存带宽饱和限制）。
 
-下一步以在 ARM 端复现对标结果、小 K 直接内核多线程化（复用 v1.8.0 1×1 专用内核范式）、深化图优化、进一步逼近 MNN 端到端吞吐为主。
+下一步以在 ARM 端复现对标结果、小 K 直接内核 tap 解码消除（复用 v1.8.0 1×1 专用内核范式）、深化图优化、进一步逼近 MNN 端到端吞吐为主。
 
 ---
 
@@ -700,7 +717,7 @@ src/conv_int8.cpp        INT8 量化卷积（量化向量化 + 1x1 专用内核�
 src/conv1x1_int8.cpp     1x1 INT8 逐点卷积调度器（VNNI/标量派发）+ 标量兜底（v1.8.0）
 src/conv1x1_int8_avx512.cpp 1x1 INT8 专用 AVX-512 VNNI 内核（A 零拷贝连续加载 + 权重预打包 4-k×16 通道跨行复用 + 累加器驻留 + 掩码 epilogue + 多线程，-mavx512f -mfma -mavx512vnni 独立单元，v1.8.0）
 src/conv_int8_direct.cpp     小 K INT8 直接卷积调度器（VNNI/标量派发）+ 标量兜底（v1.7.0）
-src/conv_int8_direct_avx512.cpp 小 K 直接卷积 AVX-512 VNNI 内核（权重预打包 4-k×16 通道 + tap 查表 + 融合 epilogue，-mavx512f -mfma -mavx512vnni 独立单元，v1.7.0）
+src/conv_int8_direct_avx512.cpp 小 K 直接卷积 AVX-512 VNNI 内核（权重预打包 4-k×16 通道 + tap 查表 + 融合 epilogue + 按输出行 OpenMP 静态并行/工作感知回落，-mavx512f -mfma -mavx512vnni 独立单元，v1.7.0 / v1.9.0 多线程）
 src/winograd.cpp        Winograd F(2,3) 3×3 快速卷积（自动路由，标量兜底 + 运行时派发）
 src/winograd_avx2.cpp   Winograd 累加内层 AVX2+FMA 向量化（-mavx2 -mfma 独立单元）
 src/winograd_avx512.cpp Winograd 累加内层 AVX-512+FMA 向量化（-mavx512f -mfma 独立单元，寄存器驻留累加 + 瓦片并行）
@@ -718,7 +735,7 @@ src/benchmark.cpp       正确性 + GEMM/卷积/端到端/融合/FC+ReLU 融合 
 tools/gen_model.py      测试模型生成器
 tools/test_bf16.cpp       BF16 GEMM 独立验证（正确性 + 吞吐 vs float，独立编译运行）
 tools/test_int8_epi.cpp  INT8 GEMM epilogue 融合独立验证（融合 vs 非融合严格 max|Δ|=0，含 gather 钳位边界）
-tools/test_int8_direct.cpp 小 K 直接卷积隔离回归（vs im2col+GEMM 严格 max|Δ|=0，覆盖 1x1/padding/stride/非整除 Cout/batch，v1.7.0）
+tools/test_int8_direct.cpp 小 K 直接卷积隔离回归（vs im2col+GEMM 严格 max|Δ|=0，含 1T/4T 多线程一致性，覆盖 1x1/padding/stride/非整除 Cout/batch，v1.7.0 / v1.9.0）
 tools/test_conv1x1.cpp   1x1 INT8 专用内核隔离回归（vs 通用 GEMM epilogue 严格 max|Δ|=0，覆盖非整除 Cout/act/nt=1,4，v1.8.0）
 ```
 

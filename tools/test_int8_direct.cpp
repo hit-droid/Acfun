@@ -84,13 +84,27 @@ static bool one(int N, int H, int W, int Cin, int Cout, int KH, int KW, int st, 
     ref_gemm_epi((int)(N * OH * OW), Cout, K, A.data(), wq.data(),
                  alpha.data(), beta.data(), ref.data(), act);
 
-    /* 新直接内核 */
+    /* 新直接内核 (单线程) */
+    acfun_set_num_threads_runtime(1);
     acfun_conv2d_int8_direct(inQ.data(), N, H, W, Cin, wq.data(), alpha.data(), beta.data(),
                              KH, KW, Cout, st, pd, OH, OW, got.data(), act);
     float md = 0; for (size_t i = 0; i < outN; ++i) md = std::max(md, std::fabs(ref[i] - got[i]));
-    bool ok = md < 1e-5f;
-    printf("N%d %dx%dx%d->%d k%d s%d p%d act%d K=%d  max|Δ|=%10.3e  %s\n",
-           N, H, W, Cin, Cout, KH, st, pd, act, K, md, ok ? "OK" : "FAIL");
+
+    /* v1.9.0: 多线程 (4T) 逐元素一致性 —— 与单线程严格 max|Δ|=0 (分割输出行, 无写冲突)。
+     * 同时对 ref (im2col+标量 GEMM) 也必须一致。 */
+    std::vector<float> gotMT(outN);
+    acfun_set_num_threads_runtime(4);
+    acfun_conv2d_int8_direct(inQ.data(), N, H, W, Cin, wq.data(), alpha.data(), beta.data(),
+                             KH, KW, Cout, st, pd, OH, OW, gotMT.data(), act);
+    acfun_set_num_threads_runtime(1);
+    float mdMT = 0, mdMTref = 0;
+    for (size_t i = 0; i < outN; ++i) {
+        mdMT = std::max(mdMT, std::fabs(got[i] - gotMT[i]));
+        mdMTref = std::max(mdMTref, std::fabs(ref[i] - gotMT[i]));
+    }
+    bool ok = (md < 1e-5f) && (mdMT == 0.0f) && (mdMTref < 1e-5f);
+    printf("N%d %dx%dx%d->%d k%d s%d p%d act%d K=%d  max|Δ|=%10.3e  MT:1T=%9.3e ref=%9.3e  %s\n",
+           N, H, W, Cin, Cout, KH, st, pd, act, K, md, mdMT, mdMTref, ok ? "OK" : "FAIL");
     return ok;
 }
 
