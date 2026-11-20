@@ -91,6 +91,12 @@ GEMM 吞吐 / 卷积 / Winograd F(2,3)/F(4,3) / 深度卷积 / 分组卷积 / �
 Post-GEMM Epilogue / INT8 GEMM / INT8 GEMM Epilogue / INT8 激活量化 / INT8 Winograd /
 1×1 INT8 专用内核 / BF16 正确性与相对加速与 v1.8.0 持平；本版未触碰其任何代码。
 
+> **关于 CI**：GitHub ubuntu-latest runner（2 核，无 AVX-512 VNNI）上 `correctness_int8_epi`
+> （INT8 GEMM 融合后处理）7 组报 `max|Δ|=1.221e-4`，与 v1.8.0 及更早版本在同一 runner 上的
+> 失败数值**逐字相同**——属该环境无 `-ffp-contract=off` 等效舍入路径的历史遗留，非本版引入；
+> 本版改动的 INT8 卷积相关正确性项在该 runner 上全部 OK。本地 AVX-512 VNNI 沙箱全基准
+> 「正确性：全部通过」，`FAIL` 计数 0。
+
 ## 4. 用法
 
 API 不变。小 K INT8 卷积（`K=KH·KW·Cin≤64` 且非 1×1/s1/p0）自动进入直接内核，
