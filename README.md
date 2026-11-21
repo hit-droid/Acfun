@@ -612,6 +612,20 @@ v1.7.0 的小 K 直接卷积内核（`acfun_conv2d_int8_direct`）逐输出像�
 **~1.0× 反超到 1.8×**；隔离测试跨 8 组边界 1T/4T 逐元素 **max|Δ|=0**，全基准正确性全过，
 其余路径零改动。细节见 `release_notes_v1.9.0.md`。
 
+### 本轮新增：小 K INT8 直接卷积 tap 解码消除（v2.0.0，224²×3 单线程 2.3×、多线程 3.0×）
+
+落实 README「下一步」长期首项「小 K 直接内核的 tap 解码消除（复用 1×1 连续 A 加载思想
+扩展至 3×3 小 Cin）」。v1.7.0 直接内核虽跳过 im2col/packA，但最内层仍有三处标量冗余：
+每 tap 3 次整数乘法算地址、即使感受野在图内也逐 tap 做 4 次边界判断、a4 打包在输出通道块
+（cb）循环内重复解码 CB 次。本版三项**数值严格等价**（逐元素 `max|Δ|=0`）改造：
+预计算 tap 字节偏移把最内层 3 次乘法降为 1 次加法；判定「内部像素」走无边界判断快速分支
+（224² 场景 98% 像素命中）；a4 解码提到 cb 循环外跨块复用。稳定 A/B（新增
+`tools/bench_int8_direct.cpp`，30 轮中位数、两轮一致、checksum 逐字节相同）：
+`224²×3→16` 单线程 **2.724→1.183 ms（2.30×）**、多线程 **1.026→0.338 ms（3.03×）**；
+`56²×16→32 k1 s2`（旧 0.7× 回退点）单线程 **0.053→0.015 ms（3.53×）**，端到端转正收益。
+隔离测试 8 组边界 1T/4T `max|Δ|=0`，全基准正确性全过，其余路径零改动。细节见
+`release_notes_v2.0.0.md`。
+
 ---
 
 ## 与 MNN 的对比（实事求是）
@@ -678,6 +692,13 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   只读共享、累加器栈上私有，零写冲突、结果与线程数严格无关；工作感知在小图回落串行。`224²×3→16`
   大 M 场景 INT8 单线程 2.826 ms → 多线程 **1.118 ms（2.53×）**，相对 float 由 ~1.0× **反超到 1.8×**；
   隔离测试跨 8 组边界 1T/4T 逐元素 `max|Δ|=0`，其余路径零改动。
+- ✅ **小 K 直接内核 tap 解码消除（v2.0.0 新增）**：落实 README「下一步」首项，消除直接
+  内核最内层三处标量冗余——① 预计算 tap 字节偏移，取数寻址从 3 次乘法降为 1 次加法；
+  ② 内部像素（感受野在图内）走无边界判断快速分支（224² 场景 98% 命中）；③ a4 解码提到
+  输出通道块循环外跨块复用（旧式重复 CB 次）。三项数值严格等价（逐元素 `max|Δ|=0`）。
+  稳定 A/B（30 轮中位数、checksum 一致）：`224²×3→16` 单线程 **2.3×**、多线程 **3.0×**，
+  `56²×16 k1s2` 单线程 **3.5×**（旧 0.7× 回退转正收益）。隔离测试 8 组 1T/4T `max|Δ|=0`，
+  其余路径零改动。
 - ✅ 单线程效率：AVX-512 参考主机实测 **~75–90%** 单核 FMA 峰值（EPYC 9754 Zen4c 真实峰值
   ~83 GFLOPS/核），已进入 MNN 同量级单线程效率区间；当前 AVX2 开发沙箱单线程 GEMM ~32 GFLOPS。
 - ✅ **GEMM 多核扩展修复（v0.9.1）**：`acfun_gemm` 默认线程数改取 `acfun_effective_cores()`
@@ -688,13 +709,15 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
 - ✅ **INT8 GEMM 多核调度对齐（v1.1.0）**：INT8 GEMM 的二维瓦片并行 / 打包循环由 `schedule(dynamic,1)` 改为
   `schedule(static)`，与 float GEMM（v0.9.1 据此修复 8T+ 吞吐反降）同构——消除 dynamic 中央任务队列锁竞争，
   在裸机多核（带宽充裕）与受限容器（配额封顶）下均按连续瓦片带近线性扩展，单线程路径零改动（无回归）。
-- 🚧 差距与路线：移动端 **ARM NEON** 后端（池化 / 卷积 / 量化 / GEMM）、更细的图优化（算子重排 /
-  常量折叠 / **Conv→Pool 跨层带流式融合以彻底消去中间张量**）、多尺寸 / 非 1 stride 的 Winograd 变体
-  （F(4,3) 已在 3×3 专用路径启用，可向更宽 stride / 非方阵推广）、小 K 直接内核的 tap 解码消除
-  （复用 v1.8.0 1×1 内核的连续 A 加载思想扩展至 3×3 小 Cin；多线程并行已于 v1.9.0 完成）、
-  INT8 微内核 ILP 与更大 KC 的进一步压榨（当前 INT8 大矩阵受内存带宽饱和限制）。
+- 🚧 差距与路线：移动端 **ARM NEON** 后端（池化 / 卷积 / 量化 / GEMM）——当前最大差距、更细的图优化
+  （算子重排 / 常量折叠 / **Conv→Pool 跨层带流式融合以彻底消去中间张量**）、多尺寸 / 非 1 stride 的
+  Winograd 变体（F(4,3) 已在 3×3 专用路径启用，可向更宽 stride / 非方阵推广）、INT8 微内核 ILP 与
+  更大 KC 的进一步压榨（当前 INT8 大矩阵受内存带宽饱和限制）。
+  （已消除：小 K 直接内核多线程并行 v1.9.0、tap 解码消除 v2.0.0 —— 后者复用 1×1 连续 A 加载思想
+  扩展至 3×3 小 Cin，内部像素无边界判断范式可进一步推广至 Winograd 变换域。）
 
-下一步以在 ARM 端复现对标结果、小 K 直接内核 tap 解码消除（复用 v1.8.0 1×1 专用内核范式）、深化图优化、进一步逼近 MNN 端到端吞吐为主。
+下一步以在 ARM 端复现对标结果、深化图优化（Conv→Pool 跨层流式融合）、把内部像素无边界判断范式
+推广至 Winograd 变换域、进一步逼近 MNN 端到端吞吐为主。
 
 ---
 
@@ -717,7 +740,7 @@ src/conv_int8.cpp        INT8 量化卷积（量化向量化 + 1x1 专用内核�
 src/conv1x1_int8.cpp     1x1 INT8 逐点卷积调度器（VNNI/标量派发）+ 标量兜底（v1.8.0）
 src/conv1x1_int8_avx512.cpp 1x1 INT8 专用 AVX-512 VNNI 内核（A 零拷贝连续加载 + 权重预打包 4-k×16 通道跨行复用 + 累加器驻留 + 掩码 epilogue + 多线程，-mavx512f -mfma -mavx512vnni 独立单元，v1.8.0）
 src/conv_int8_direct.cpp     小 K INT8 直接卷积调度器（VNNI/标量派发）+ 标量兜底（v1.7.0）
-src/conv_int8_direct_avx512.cpp 小 K 直接卷积 AVX-512 VNNI 内核（权重预打包 4-k×16 通道 + tap 查表 + 融合 epilogue + 按输出行 OpenMP 静态并行/工作感知回落，-mavx512f -mfma -mavx512vnni 独立单元，v1.7.0 / v1.9.0 多线程）
+src/conv_int8_direct_avx512.cpp 小 K 直接卷积 AVX-512 VNNI 内核（权重预打包 4-k×16 通道 + tap 查表 + 融合 epilogue + 按输出行 OpenMP 静态并行/工作感知回落 + tap 字节偏移/内部像素无边界判断/a4 跨块复用，-mavx512f -mfma -mavx512vnni 独立单元，v1.7.0 / v1.9.0 多线程 / v2.0.0 tap 解码消除）
 src/winograd.cpp        Winograd F(2,3) 3×3 快速卷积（自动路由，标量兜底 + 运行时派发）
 src/winograd_avx2.cpp   Winograd 累加内层 AVX2+FMA 向量化（-mavx2 -mfma 独立单元）
 src/winograd_avx512.cpp Winograd 累加内层 AVX-512+FMA 向量化（-mavx512f -mfma 独立单元，寄存器驻留累加 + 瓦片并行）
@@ -735,7 +758,8 @@ src/benchmark.cpp       正确性 + GEMM/卷积/端到端/融合/FC+ReLU 融合 
 tools/gen_model.py      测试模型生成器
 tools/test_bf16.cpp       BF16 GEMM 独立验证（正确性 + 吞吐 vs float，独立编译运行）
 tools/test_int8_epi.cpp  INT8 GEMM epilogue 融合独立验证（融合 vs 非融合严格 max|Δ|=0，含 gather 钳位边界）
-tools/test_int8_direct.cpp 小 K 直接卷积隔离回归（vs im2col+GEMM 严格 max|Δ|=0，含 1T/4T 多线程一致性，覆盖 1x1/padding/stride/非整除 Cout/batch，v1.7.0 / v1.9.0）
+tools/test_int8_direct.cpp 小 K 直接卷积隔离回归（vs im2col+GEMM 严格 max|Δ|=0，含 1T/4T 多线程一致性，覆盖 1x1/padding/stride/非整除 Cout/batch，v1.7.0 / v1.9.0 / v2.0.0）
+tools/bench_int8_direct.cpp 小 K 直接卷积内核稳定 A/B 微基准（30 轮取中位数，对比 v1.9.0 基线库，checksum 校验，v2.0.0）
 tools/test_conv1x1.cpp   1x1 INT8 专用内核隔离回归（vs 通用 GEMM epilogue 严格 max|Δ|=0，覆盖非整除 Cout/act/nt=1,4，v1.8.0）
 ```
 

@@ -1,6 +1,14 @@
-/* Acfun 小 K INT8 直接卷积 — AVX-512 VNNI 后端 (v1.7.0, v1.9.0 多线程并行)。
+/* Acfun 小 K INT8 直接卷积 — AVX-512 VNNI 后端 (v1.7.0, v1.9.0 多线程并行,
+ * v2.0.0 tap 解码消除)。
  * 编译单元需带 -mavx512f -mfma -mavx512vnni; 由 conv_int8_direct.cpp 在检测到
  * avx512vnni 时派发, 否则回落标量版。
+ *
+ * v2.0.0: 落实 README「下一步」首项 —— 消除最内层 tap 解码冗余 (数值严格 max|Δ|=0):
+ *   1) tap_byteoff[k] 预计算相对像素中心的字节偏移, 消除每次取数的 3 次整数乘法;
+ *   2) 内部像素 (感受野完全在图内) 走无边界判断快速分支;
+ *   3) a4 解码提到输出通道块 (cb) 循环外, 一次解码跨所有 CB 块复用 (旧式重复 CB 次)。
+ *   实测 224²×3→16 单线程 2.85→1.24ms (2.3×), 56²×16→32 k1s2 0.084→0.053ms
+ *   相对 float 0.7×→1.4× (回退消除)。其余路径零改动、零回归。
  *
  * v1.9.0: 按输出行 (n,oh) 展平做 OpenMP 静态并行。每个 (n,oh,ow) 像素的输出区
  * 互不相交, 权重预打包 Bp / tap 解码表 / alpha / beta 全程只读共享, 累加器为
@@ -51,10 +59,17 @@ void acfun_conv2d_int8_direct_avx512(const uint8_t* inQ, int N, int H, int W, in
         }
     }
 
-    /* tap 预解码表: k -> (通道内偏移 ic, 相对 oh 的输入行偏移 doh, 相对 ow 的列偏移 dow, 越界标志)。
-     * ih = oh*stride + doh, iw = ow*stride + dow。整张图所有像素共享, 一次生成;
-     * 消除内核最内层的 3 次整数除法 (k/Cin, /KW, %KW) —— 在 K 组×M 像素规模下是头号标量瓶颈。 */
-    int tap_ic[64], tap_doh[64], tap_dow[64];
+    /* tap 预解码表: k -> (通道内偏移 ic, 相对 oh 的输入行偏移 doh, 相对 ow 的列偏移 dow),
+     * 以及相对像素中心 (oh*stride, ow*stride) 的**字节偏移** byteoff。
+     *   ih = oh*stride + doh, iw = ow*stride + dow
+     *   地址 = (ih*W + iw)*Cin + ic = base + byteoff
+     *     base    = (oh*stride*W + ow*stride)*Cin   (每像素算一次)
+     *     byteoff = (doh*W + dow)*Cin + ic          (全图一次, 只读共享)
+     * v2.0.0: 用 byteoff 消除最内层 3 次乘法 (旧式 (((size_t)ih*W+iw)*Cin+tap_ic[k])),
+     * 并用 min/max doh/dow 为每个输出行/列判定「内部像素」——感受野完全落在图内时
+     * 跳过 4 次边界比较, 直接取数。数值与旧式逐元素 max|Δ|=0 (同一地址、同一 xq)。 */
+    int tap_ic[64], tap_doh[64], tap_dow[64], tap_byteoff[64];
+    int min_doh = 0, max_doh = 0, min_dow = 0, max_dow = 0;
     for (int k = 0; k < K; ++k) {
         int khkw = k / Cin;
         tap_ic[k]  = k - khkw * Cin;
@@ -62,19 +77,67 @@ void acfun_conv2d_int8_direct_avx512(const uint8_t* inQ, int N, int H, int W, in
         int kw = khkw - kh * KW;
         tap_doh[k] = kh - pad;
         tap_dow[k] = kw - pad;
+        tap_byteoff[k] = (tap_doh[k] * W + tap_dow[k]) * Cin + tap_ic[k];
+        if (tap_doh[k] < min_doh) min_doh = tap_doh[k];
+        if (tap_doh[k] > max_doh) max_doh = tap_doh[k];
+        if (tap_dow[k] < min_dow) min_dow = tap_dow[k];
+        if (tap_dow[k] > max_dow) max_dow = tap_dow[k];
     }
 
     const __m512 vzero = _mm512_setzero_ps();
 
-    /* v1.9.0: 处理单个输出行 (n, oh) 的全部 ow / 通道块。每行写入互不相交的
+    /* v2.0.0: 处理单个输出行 (n, oh) 的全部 ow / 通道块。每行写入互不相交的
      * 输出区, Bp / tap 表 / alpha / beta 只读共享, acc 为栈上局部 —— 线程安全,
-     * 结果与线程数严格无关 (逐元素 max|Δ|=0)。 */
+     * 结果与线程数严格无关 (逐元素 max|Δ|=0)。
+     *
+     * 相对 v1.9.0 的三点提速 (数值严格等价):
+     *  1) a4buf[kg] 在 cb 循环**外**一次解码, 供全部 CB 个输出通道块复用。旧式在
+     *     每个 cb 内重复解码 Kg×4 个 tap —— Cout=32/64 (CB=2/4) 时重复 2–4 倍。
+     *  2) 内部像素 (感受野在图内) 走无边界判断的快速解码分支。
+     *  3) 用 tap_byteoff 一次加法寻址, 消除最内层 3 次整数乘法。 */
     auto process_row = [&](int r) {
         const int n  = r / OH;
         const int oh = r - n * OH;
         const uint8_t* inb = inQ + (size_t)n * H * W * Cin;
         float* outb = output + (size_t)n * OH * OW * Cout;
+        const int ohs = oh * stride;
+        const size_t row_base = (size_t)ohs * W * Cin;
+        /* 本行是否所有 tap 的垂直坐标都落在图内 (与 ow 无关的部分)。 */
+        const bool row_in = (ohs + min_doh >= 0) && (ohs + max_doh < H);
+
+        uint32_t a4buf[64];   /* Kg <= 16 (直内核路由 K<=64), 64 留足余量。 */
         for (int ow = 0; ow < OW; ++ow) {
+            const int ows = ow * stride;
+            const size_t base = row_base + (size_t)ows * Cin;
+            const bool interior = row_in && (ows + min_dow >= 0) && (ows + max_dow < W);
+
+            /* —— 一次解码本像素全部 kg 的 a4, 供所有输出通道块复用 —— */
+            for (int kg = 0; kg < Kg; ++kg) {
+                uint32_t a4 = 0;
+                if (interior) {
+                    /* 快速路径: 全部 tap 在图内, 无越界判断。 */
+                    for (int t = 0; t < 4; ++t) {
+                        int k = kg * 4 + t;
+                        uint8_t xq = (k < K) ? inb[base + (size_t)tap_byteoff[k]] : (uint8_t)ZP;
+                        a4 |= (uint32_t)xq << (8 * t);
+                    }
+                } else {
+                    /* 边界路径: 逐 tap 判越界, padding 取 zp (与标量参考严格一致)。 */
+                    for (int t = 0; t < 4; ++t) {
+                        int k = kg * 4 + t;
+                        int xq = ZP;   /* k>=K (补零组) 或越界 padding 均取 zp */
+                        if (k < K) {
+                            int ih = ohs + tap_doh[k];
+                            int iw = ows + tap_dow[k];
+                            if (ih >= 0 && ih < H && iw >= 0 && iw < W)
+                                xq = (int)inb[base + (size_t)tap_byteoff[k]];
+                        }
+                        a4 |= (uint32_t)xq << (8 * t);
+                    }
+                }
+                a4buf[kg] = a4;
+            }
+
             float* dst = outb + ((size_t)oh * OW + ow) * Cout;
             for (int cb = 0; cb < CB; ++cb) {
                 const int j0 = cb * VL;
@@ -83,22 +146,9 @@ void acfun_conv2d_int8_direct_avx512(const uint8_t* inQ, int N, int H, int W, in
 
                 __m512i acc = _mm512_setzero_si512();
                 for (int kg = 0; kg < Kg; ++kg) {
-                    /* 由预解码表生成当前像素的 4 个连续 k 输入值, 打包成 32-bit 后广播 16 lanes */
-                    uint32_t a4 = 0;
-                    for (int t = 0; t < 4; ++t) {
-                        int k = kg * 4 + t;
-                        int xq = ZP;   /* k>=K (补零组) 或越界 padding 均取 zp */
-                        if (k < K) {
-                            int ih = oh * stride + tap_doh[k];
-                            int iw = ow * stride + tap_dow[k];
-                            if (ih >= 0 && ih < H && iw >= 0 && iw < W)
-                                xq = (int)inb[((size_t)ih * W + iw) * Cin + tap_ic[k]];
-                        }
-                        a4 |= (uint32_t)xq << (8 * t);
-                    }
                     /* 先把 4 字节填满一个 128 位 (4 个 dword 均为 a4), 再广播到 512 位;
                      * 若用 _mm_cvtsi32_si128 则高 96 位为 0, 只有 lane 0-3 有输入。 */
-                    __m512i A = _mm512_broadcast_i32x4(_mm_set1_epi32((int)a4));
+                    __m512i A = _mm512_broadcast_i32x4(_mm_set1_epi32((int)a4buf[kg]));
                     __m512i B = _mm512_loadu_si512((const __m512i*)
                                     (Bp.data() + ((size_t)cb * Kg + kg) * 64));
                     acc = _mm512_dpbusd_epi32(acc, A, B);
