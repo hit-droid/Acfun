@@ -626,6 +626,18 @@ v1.7.0 的小 K 直接卷积内核（`acfun_conv2d_int8_direct`）逐输出像�
 隔离测试 8 组边界 1T/4T `max|Δ|=0`，全基准正确性全过，其余路径零改动。细节见
 `release_notes_v2.0.0.md`。
 
+### 本轮新增：INT8 Winograd 输入变换跨 16 通道向量化（v2.1.0，112²×16 稳定 2.05×，两处回退点转正）
+
+落实 README「下一步」——把 v2.0.0「内部像素无边界判断」范式推广至 Winograd 变换域。`wino_tile_int8`
+输入变换段此前逐通道做 16 次单字节 gather + 24 次标量 BT 加减，是小通道场景的标量热点。利用
+`dh[ij·Cin+c]` 与 NHWC `pbase` 中 c 连续的布局，改为**跨 16 通道 AVX2 向量化**（一次 16 字节
+load + `cvtepu8_epi16` + 48 次向量加减），内部瓦片跳过边界判断、尾通道标量兜底，数值严格等价
+（9 组配置输出 hash 两版逐位相同 / `max|Δ|=0`）。稳定 A/B（`tools/bench_wino_int8.cpp`，30 轮
+中位数、两轮一致）：`112²×16→16` **2.05×**、`113×97×16→48` **1.69×**、`56²×32→32` **1.60×**；
+全基准 INT8 Winograd 段相对 float 的两处回退点 `112²×16`（0.7×→**1.3×**）、`113×97×16`
+（0.9×→**1.1×**）**双双转正**，主乘累加 / 输出变换 / 量化遍零改动。细节见
+`release_notes_v2.1.0.md`。
+
 ---
 
 ## 与 MNN 的对比（实事求是）
@@ -699,6 +711,15 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   稳定 A/B（30 轮中位数、checksum 一致）：`224²×3→16` 单线程 **2.3×**、多线程 **3.0×**，
   `56²×16 k1s2` 单线程 **3.5×**（旧 0.7× 回退转正收益）。隔离测试 8 组 1T/4T `max|Δ|=0`，
   其余路径零改动。
+- ✅ **INT8 Winograd 输入变换跨 16 通道向量化（v2.1.0 新增）**：落实 README「下一步」——把 v2.0.0
+  「内部像素无边界判断」范式推广至 Winograd 变换域。利用 `dh[ij·Cin+c]` 与 NHWC `pbase` 中 c 连续
+  的布局，把 `wino_tile_int8` 输入变换段的逐通道标量 gather（每通道 16 次单字节读 + 24 次标量 BT
+  加减）改为**跨 16 通道 AVX2 向量化**（一次 16 字节 load + `cvtepu8_epi16` 展开 + 48 次向量加减），
+  并对 4×4 块全在图内的**内部瓦片**跳过每 `(k,l)` 的边界判断；尾通道标量兜底，数值严格等价
+  （9 组配置输出 hash 两版逐位相同 / `max|Δ|=0`）。稳定 A/B（30 轮中位数、两轮一致）：
+  `112²×16→16` **2.05×**、`113×97×16→48` **1.69×**、`56²×32→32` **1.60×**；全基准 INT8 Winograd
+  段两处回退点 `112²×16`（0.7×→**1.3×**）、`113×97×16`（0.9×→**1.1×**）**双双转正**，其余同步提升，
+  主乘累加 / 输出变换 / 量化遍零改动。细节见 `release_notes_v2.1.0.md`。
 - ✅ 单线程效率：AVX-512 参考主机实测 **~75–90%** 单核 FMA 峰值（EPYC 9754 Zen4c 真实峰值
   ~83 GFLOPS/核），已进入 MNN 同量级单线程效率区间；当前 AVX2 开发沙箱单线程 GEMM ~32 GFLOPS。
 - ✅ **GEMM 多核扩展修复（v0.9.1）**：`acfun_gemm` 默认线程数改取 `acfun_effective_cores()`
@@ -714,10 +735,12 @@ MNN 在移动端凭借 **ARM NEON + int8 量化 + 极致 autotuning** 达到极�
   Winograd 变体（F(4,3) 已在 3×3 专用路径启用，可向更宽 stride / 非方阵推广）、INT8 微内核 ILP 与
   更大 KC 的进一步压榨（当前 INT8 大矩阵受内存带宽饱和限制）。
   （已消除：小 K 直接内核多线程并行 v1.9.0、tap 解码消除 v2.0.0 —— 后者复用 1×1 连续 A 加载思想
-  扩展至 3×3 小 Cin，内部像素无边界判断范式可进一步推广至 Winograd 变换域。）
+  扩展至 3×3 小 Cin；INT8 Winograd 输入变换跨 16 通道向量化 v2.1.0 —— 内部像素无边界判断范式
+  已推广至 Winograd 变换域，两处小通道回退点转正。）
 
-下一步以在 ARM 端复现对标结果、深化图优化（Conv→Pool 跨层流式融合）、把内部像素无边界判断范式
-推广至 Winograd 变换域、进一步逼近 MNN 端到端吞吐为主。
+下一步以在 ARM 端复现对标结果、深化图优化（Conv→Pool 跨层流式融合）、把跨 16 通道向量化输入
+变换推广至 float Winograd、把内部像素无边界判断进一步推广至 INT8 Winograd 输出变换、进一步逼近
+MNN 端到端吞吐为主。
 
 ---
 
@@ -744,7 +767,7 @@ src/conv_int8_direct_avx512.cpp 小 K 直接卷积 AVX-512 VNNI 内核（权重�
 src/winograd.cpp        Winograd F(2,3) 3×3 快速卷积（自动路由，标量兜底 + 运行时派发）
 src/winograd_avx2.cpp   Winograd 累加内层 AVX2+FMA 向量化（-mavx2 -mfma 独立单元）
 src/winograd_avx512.cpp Winograd 累加内层 AVX-512+FMA 向量化（-mavx512f -mfma 独立单元，寄存器驻留累加 + 瓦片并行）
-src/winograd_int8.cpp   INT8 Winograd 3×3 整数域快速卷积（AVX-512 `vpmaddwd` 融合乘加，对标 MNN int8 卷积，-mavx512f -mavx512bw -mfma 独立单元）
+src/winograd_int8.cpp   INT8 Winograd 3×3 整数域快速卷积（AVX-512 `vpmaddwd` 融合乘加，对标 MNN int8 卷积；v2.1.0 输入变换跨 16 通道 AVX2 向量化 + 内部瓦片无边界判断，-mavx512f -mavx512bw -mfma 独立单元）
 src/layers.cpp          卷积（含融合 ReLU / Winograd / 深度&分组 自动路由）、全连接、FC+ReLU 融合、激活、池化、Softmax、BN
 src/dw.cpp              深度卷积（逐通道）标量参考 + AVX-512 派发
 src/dw_avx512.cpp       深度卷积 AVX-512 跨通道 16 路向量化内核（-mavx512f -mfma 独立单元）
@@ -760,6 +783,7 @@ tools/test_bf16.cpp       BF16 GEMM 独立验证（正确性 + 吞吐 vs float�
 tools/test_int8_epi.cpp  INT8 GEMM epilogue 融合独立验证（融合 vs 非融合严格 max|Δ|=0，含 gather 钳位边界）
 tools/test_int8_direct.cpp 小 K 直接卷积隔离回归（vs im2col+GEMM 严格 max|Δ|=0，含 1T/4T 多线程一致性，覆盖 1x1/padding/stride/非整除 Cout/batch，v1.7.0 / v1.9.0 / v2.0.0）
 tools/bench_int8_direct.cpp 小 K 直接卷积内核稳定 A/B 微基准（30 轮取中位数，对比 v1.9.0 基线库，checksum 校验，v2.0.0）
+tools/bench_wino_int8.cpp INT8 Winograd 输入变换隔离正确性（9 组输出 hash 逐位比对）+ 稳定 A/B 微基准（6 场景 30 轮中位数，v2.1.0）
 tools/test_conv1x1.cpp   1x1 INT8 专用内核隔离回归（vs 通用 GEMM epilogue 严格 max|Δ|=0，覆盖非整除 Cout/act/nt=1,4，v1.8.0）
 ```
 

@@ -69,6 +69,59 @@ inline void input_transform_u8(const uint8_t* d, int16_t* dh, int Cin, int cbase
     }
 }
 
+/* v2.1.0: 跨 16 通道 AVX2 向量化的 4x4 输入变换 (BT·d·BTᵀ)。
+ *
+ * 数据布局洞察: dh 为 [ij*Cin + c] (同一 ij 的 c 连续), pbase 为 NHWC (通道连续) ——
+ * 对固定空间位置 (pr,pc), 跨 16 个通道 c..c+15 恰是连续 16 字节, 一次 _mm_loadu_si128
+ * 即可取回。原实现逐通道做 16 次带边界判断的单字节 gather + 24 次标量加减, 是小通道
+ * (Cin=16) 场景的标量热点。本函数一次处理 16 通道: 16 次 uint8→int16 展开 + 48 次向量
+ * 加减 (两遍可分离 BT), 指令数大幅下降。
+ *
+ * 内部瓦片快速路径 (inner): 4x4 块 (pr0..pr0+3, pc0..pc0+3) 全落在 pbase 有效索引内时,
+ * 省去每 (k,l) 的 4 次边界比较, 直接连续 load —— 即 README「下一步」要求把 v2.0.0 的
+ * 「内部像素无边界判断」范式推广至 Winograd 变换域。边界瓦片仍逐 (k,l) 判断, 越界填 zp。
+ *
+ * 数值严格等价: uint8→int16 后仅加减, U 中间值 ≤510、dh 结果 ≤1020, 均不溢出 int16,
+ * 无符号回绕, 故与标量 input_transform_u8 逐位一致 (输出 hash 相同 / max|Δ|=0)。
+ *
+ * 参数 OHp2=OH+2, OWp2=OW+2 为 pbase 的行列数; cb 为本块起始通道 (cb+16<=Cin)。 */
+inline void input_transform_16c(const uint8_t* pbase, int pr0, int pc0, int pstride,
+                                int OHp2, int OWp2, int Cin, int cb,
+                                int16_t* dh, bool inner) {
+    const int ZP = 128;
+    __m256i dv[16];   /* dv[k*4+l] = 该空间位置 16 个通道的 uint8→int16 */
+    for (int k = 0; k < 4; ++k) {
+        int pr = pr0 + k;
+        for (int l = 0; l < 4; ++l) {
+            int pc = pc0 + l;
+            if (inner || ((unsigned)pr < (unsigned)OHp2 && (unsigned)pc < (unsigned)OWp2)) {
+                const __m128i raw = _mm_loadu_si128(
+                    (const __m128i*)&pbase[(size_t)pr * pstride + (size_t)pc * Cin + cb]);
+                dv[k * 4 + l] = _mm256_cvtepu8_epi16(raw);
+            } else {
+                dv[k * 4 + l] = _mm256_set1_epi16(ZP);   /* 越界 = 零点 zp */
+            }
+        }
+    }
+    /* 第一遍: 列方向 (l) —— U[i][l], i=行变换输出索引 */
+    __m256i U[4][4];
+    for (int l = 0; l < 4; ++l) {
+        __m256i c0 = dv[0 * 4 + l], c1 = dv[1 * 4 + l], c2 = dv[2 * 4 + l], c3 = dv[3 * 4 + l];
+        U[0][l] = _mm256_sub_epi16(c0, c2);
+        U[1][l] = _mm256_add_epi16(c1, c2);
+        U[2][l] = _mm256_sub_epi16(c2, c1);
+        U[3][l] = _mm256_sub_epi16(c3, c1);
+    }
+    /* 第二遍: 行方向 (i) -> dh[(i*4+j)*Cin + cb..cb+15] */
+    for (int i = 0; i < 4; ++i) {
+        __m256i u0 = U[i][0], u1 = U[i][1], u2 = U[i][2], u3 = U[i][3];
+        _mm256_storeu_si256((__m256i*)&dh[(size_t)(i * 4 + 0) * Cin + cb], _mm256_sub_epi16(u0, u2));
+        _mm256_storeu_si256((__m256i*)&dh[(size_t)(i * 4 + 1) * Cin + cb], _mm256_add_epi16(u1, u2));
+        _mm256_storeu_si256((__m256i*)&dh[(size_t)(i * 4 + 2) * Cin + cb], _mm256_sub_epi16(u2, u1));
+        _mm256_storeu_si256((__m256i*)&dh[(size_t)(i * 4 + 3) * Cin + cb], _mm256_sub_epi16(u3, u1));
+    }
+}
+
 /* 单通道 3x3 int8 权重 -> 16 个 int16 滤波变换值 (g_hat2 = round(G̃·g·G̃ᵀ), 携带 ×4 缩放)。
  * g[9] row-major (x*3+y); gh2[16] = g_hat2[ij]。G̃ = 2G = [[2,0,0],[1,1,1],[1,-1,1],[0,0,2]]。 */
 inline void filter_transform_int8(const int8_t* g, int16_t* gh2) {
@@ -180,10 +233,17 @@ static void wino_tile_int8(int ty, int tx, int OH, int OW, int Cin, int Cout, in
     const int ZP = 128;
     int oh0 = 2 * ty, ow0 = 2 * tx;
 
-    /* 1) 本瓦片所有输入通道的 d_hat (int16), 布局 dh[ij*Cin + c] (ij 内 c 连续) —— 瓦片内联, L1 驻留 */
+    /* 1) 本瓦片所有输入通道的 d_hat (int16), 布局 dh[ij*Cin + c] (ij 内 c 连续) —— 瓦片内联, L1 驻留。
+     * v2.1.0: 跨 16 通道 AVX2 向量化, 内部瓦片跳过边界判断 (数值严格等价, 见 input_transform_16c)。 */
     int16_t* dh = dhq_scratch(Cin);
-    for (int c = 0; c < Cin; ++c) {
-        int pr0 = 2 * ty, pc0 = 2 * tx;
+    const int pr0 = 2 * ty, pc0 = 2 * tx;
+    /* 内部瓦片: 4x4 块全落在 pbase [0,OH+2)x[0,OW+2) 内 -> 全部 load 合法, 免边界判断。
+     * pr0>=0,pc0>=0 恒成立, 故仅需判上界。 */
+    const bool inner = (pr0 + 3 < OH + 2) && (pc0 + 3 < OW + 2);
+    int c = 0;
+    for (; c + 16 <= Cin; c += 16)
+        input_transform_16c(pbase, pr0, pc0, pstride, OH + 2, OW + 2, Cin, c, dh, inner);
+    for (; c < Cin; ++c) {                                   /* 尾通道 (<16): 标量兜底 */
         uint8_t dblk[16];
         for (int k = 0; k < 4; ++k) {
             int pr = pr0 + k;
